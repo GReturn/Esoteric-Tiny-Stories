@@ -14,6 +14,7 @@ class Config:
     n_heads = 6
     dim = 384
     dropout = 0.1
+    alpha0 = 0.5
     mask_token_id = 0
 
 cfg = Config()

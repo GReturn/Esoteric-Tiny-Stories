@@ -19,11 +19,14 @@ class Config:
     n_heads = 6
     dim = 384
     dropout = 0.1
-    batch_size = 16
+    batch_size = 64
     lr = 3e-4
     max_steps = 25000
     eval_interval = 500
     eval_iters = 200
+    ar_weight = 1.0
+    mdm_weight = 1.0
+    alpha0 = 0.5
     mask_token_id = 0
     pad_token_id = 0
 
