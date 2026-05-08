@@ -15,14 +15,14 @@ from dataclasses import dataclass
 class Config:
     vocab_size = 8000
     seq_len = 128
-    n_layers = 8
-    n_heads = 8
-    dim = 512
-    dropout = 0.1
+    n_layers = 12
+    n_heads = 12
+    dim = 768
+    dropout = 0.05
     batch_size = 128
     lr = 5e-4
-    warmup_steps = 100
-    max_steps = 2000
+    warmup_steps = 500
+    max_steps = 25000
     eval_interval = 200
     eval_iters = 20
     ar_weight = 1.0
@@ -230,7 +230,7 @@ if __name__ == "__main__":
     train_data, val_data = all_data[:n], all_data[n:]
 
     model = EsoLM().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.1)
     
     train_losses, val_losses = [], []
     train_ar_losses, train_mdm_losses = [], []

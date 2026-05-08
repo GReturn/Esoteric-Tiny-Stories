@@ -10,10 +10,10 @@ from dataclasses import dataclass
 class Config:
     vocab_size = 8000
     seq_len = 128
-    n_layers = 8
-    n_heads = 8
-    dim = 512
-    dropout = 0.1
+    n_layers = 12
+    n_heads = 12
+    dim = 768
+    dropout = 0.05
     alpha0 = 0.5
     mask_token_id = 0
 
