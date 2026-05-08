@@ -171,7 +171,7 @@ if __name__ == "__main__":
     sp.load('tinystories_bpe.model')
     
     model = EsoLM().to(device)
-    model.load_state_dict(torch.load("esolm_tinystories.pt"))
+    model.load_state_dict(torch.load("esolm_tinystories.pt", weights_only=True))
     print("Model loaded successfully.")
     
     while True:
