@@ -102,6 +102,12 @@ class EsoLM(nn.Module):
         return self.head(self.ln(h))
 
 # --- Utils ---
+def get_causal_mask(T, device):
+    """Standard causal mask for Autoregressive training."""
+    mask = torch.tril(torch.ones(T, T, device=device)).bool()
+    attn_bias = torch.zeros(T, T, device=device).masked_fill(~mask, float('-inf'))
+    return attn_bias.unsqueeze(0).unsqueeze(0) # (1, 1, T, T)
+
 def get_esolm_b_diffusion_mask(is_masked):
     B, T = is_masked.shape
     device = is_masked.device
@@ -122,22 +128,34 @@ def estimate_loss(model, train_data, val_data):
     out = {}
     model.eval()
     for split, data in [('train', train_data), ('val', val_data)]:
-        losses = torch.zeros(cfg.eval_iters)
+        losses_ar = torch.zeros(cfg.eval_iters)
+        losses_mdm = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
             x_clean = get_batch(data)
             B, L = x_clean.shape
+            
+            # AR Loss
+            causal_bias = get_causal_mask(L, device)
+            logits_ar = model(x_clean, attn_bias=causal_bias)
+            loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_clean[:, 1:].reshape(-1))
+            losses_ar[k] = loss_ar.item()
+            
+            # MDM Loss
             t = torch.randint(1, L, (B,), device=device)
             is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(B, L)).bool()
             x_corrupt = x_clean.clone()
             x_corrupt[is_masked] = cfg.mask_token_id
-            if not is_masked.any():
-                losses[k] = 0
-            else:
+            if is_masked.any():
                 attn_bias = get_esolm_b_diffusion_mask(is_masked)
-                logits = model(x_corrupt, attn_bias=attn_bias)
-                loss = F.cross_entropy(logits.view(-1, cfg.vocab_size), x_clean.view(-1), reduction='none')
-                losses[k] = loss[is_masked.view(-1)].mean().item()
-        out[split] = losses.mean()
+                logits_mdm = model(x_corrupt, attn_bias=attn_bias)
+                loss_mdm = F.cross_entropy(logits_mdm.view(-1, cfg.vocab_size), x_clean.view(-1), reduction='none')
+                losses_mdm[k] = loss_mdm[is_masked.view(-1)].mean().item()
+            else:
+                losses_mdm[k] = 0
+                
+        out[split] = (cfg.ar_weight * losses_ar.mean() + cfg.mdm_weight * losses_mdm.mean())
+        out[f"{split}_ar"] = losses_ar.mean()
+        out[f"{split}_mdm"] = losses_mdm.mean()
     model.train()
     return out
 
@@ -192,41 +210,73 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     
     train_losses, val_losses = [], []
+    val_ar_losses, val_mdm_losses = [], []
     steps_list = []
     
-    print(f"Starting training on {device}...")
+    print(f"Starting hybrid training (AR + MDM) on {device}...")
+    print("Graphs will be saved to loss_plot.png (Safe to interrupt with Ctrl+C)")
+    
     pbar = tqdm(range(cfg.max_steps))
-    for step in pbar:
-        if step % cfg.eval_interval == 0:
-            losses = estimate_loss(model, train_data, val_data)
-            train_losses.append(losses['train'])
-            val_losses.append(losses['val'])
-            steps_list.append(step)
-            pbar.set_description(f"Step {step} | Train: {losses['train']:.4f} | Val: {losses['val']:.4f}")
-            print(f"\nSample: {generate_diffusion(model, sp, 'Once upon a time,')}\n")
+    try:
+        for step in pbar:
+            if step % cfg.eval_interval == 0:
+                losses = estimate_loss(model, train_data, val_data)
+                train_losses.append(losses['train'])
+                val_losses.append(losses['val'])
+                val_ar_losses.append(losses['val_ar'])
+                val_mdm_losses.append(losses['val_mdm'])
+                steps_list.append(step)
+                
+                pbar.set_description(f"Step {step} | AR: {losses['val_ar']:.4f} | MDM: {losses['val_mdm']:.4f}")
+                print(f"\nSample: {generate_diffusion(model, sp, 'Once upon a time,')}\n")
 
-        x_clean = get_batch(train_data)
-        B, L = x_clean.shape
-        t = torch.randint(1, L, (B,), device=device)
-        is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(B, L)).bool()
-        x_corrupt = x_clean.clone()
-        x_corrupt[is_masked] = cfg.mask_token_id
-        if is_masked.any():
-            attn_bias = get_esolm_b_diffusion_mask(is_masked)
-            logits = model(x_corrupt, attn_bias=attn_bias)
-            loss = F.cross_entropy(logits.view(-1, cfg.vocab_size), x_clean.view(-1), reduction='none')
-            loss = loss[is_masked.view(-1)].mean()
+            # Hybrid Step: Split batch into AR and MDM
+            x_all = get_batch(train_data)
+            B, L = x_all.shape
+            half_B = B // 2
+            
+            # 1. AR component
+            x_ar = x_all[:half_B]
+            causal_bias = get_causal_mask(L, device)
+            logits_ar = model(x_ar, attn_bias=causal_bias)
+            loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_ar[:, 1:].reshape(-1))
+            
+            # 2. MDM component
+            x_mdm_clean = x_all[half_B:]
+            t = torch.randint(1, L, (half_B,), device=device)
+            is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(half_B, L)).bool()
+            x_corrupt = x_mdm_clean.clone()
+            x_corrupt[is_masked] = cfg.mask_token_id
+            
+            if is_masked.any():
+                attn_bias = get_esolm_b_diffusion_mask(is_masked)
+                logits_mdm = model(x_corrupt, attn_bias=attn_bias)
+                loss_mdm_flat = F.cross_entropy(logits_mdm.view(-1, cfg.vocab_size), x_mdm_clean.view(-1), reduction='none')
+                loss_mdm = loss_mdm_flat[is_masked.view(-1)].mean()
+            else:
+                loss_mdm = 0.0 * loss_ar
+                
+            loss = cfg.ar_weight * loss_ar + cfg.mdm_weight * loss_mdm
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-    torch.save(model.state_dict(), "esolm_tinystories.pt")
-    plt.figure(figsize=(10, 6))
-    plt.plot(steps_list, train_losses, label='Train Loss')
-    plt.plot(steps_list, val_losses, label='Val Loss')
-    plt.xlabel('Steps')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title('Eso-LM Training Progress')
-    plt.savefig('loss_plot.png')
-    print("Done! Saved model and loss_plot.png")
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving progress...")
+
+    finally:
+        torch.save(model.state_dict(), "esolm_tinystories.pt")
+        
+        if len(steps_list) > 0:
+            plt.figure(figsize=(10, 6))
+            plt.plot(steps_list, val_ar_losses, label='Val AR (Grammar)', color='blue')
+            plt.plot(steps_list, val_mdm_losses, label='Val MDM (Denoising)', color='green')
+            plt.plot(steps_list, val_losses, label='Total Val Loss', color='red', linestyle='--')
+            plt.xlabel('Steps')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.title('Eso-LM Faithful Training Progress')
+            plt.grid(True, alpha=0.3)
+            plt.savefig('loss_plot.png')
+            print("Final model saved to esolm_tinystories.pt")
+            print("Final loss plot saved to loss_plot.png")

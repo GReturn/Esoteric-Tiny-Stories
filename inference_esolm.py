@@ -20,6 +20,10 @@ cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Model Components (Must match train_esolm.py) ---
+def get_causal_mask(T, device):
+    mask = torch.tril(torch.ones(T, T, device=device)).bool()
+    attn_bias = torch.zeros(T, T, device=device).masked_fill(~mask, float('-inf'))
+    return attn_bias.unsqueeze(0).unsqueeze(0)
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -101,7 +105,7 @@ def get_esolm_b_diffusion_mask(is_masked):
     return attn_bias.unsqueeze(1)
 
 @torch.no_grad()
-def generate(model, sp, prompt, steps=64, temperature=0.8):
+def generate(model, sp, prompt, steps=16, temperature=0.8):
     model.eval()
     tokens = sp.encode(prompt)
     x = torch.tensor([tokens], device=device)
@@ -109,9 +113,12 @@ def generate(model, sp, prompt, steps=64, temperature=0.8):
     gen_len = cfg.seq_len - L0
     x = torch.cat([x, torch.full((1, gen_len), cfg.mask_token_id, device=device)], dim=1)
     
-    print(f"Generating from prompt: '{prompt}'...")
+    print(f"Phase 1: Diffusion ({steps} steps)...")
     for step in range(steps):
         is_masked = (x == cfg.mask_token_id)
+        if not is_masked.any(): break
+        
+        # Eso-LM B mask for diffusion
         attn_bias = get_esolm_b_diffusion_mask(is_masked)
         logits = model(x, attn_bias=attn_bias)
         
@@ -126,7 +133,8 @@ def generate(model, sp, prompt, steps=64, temperature=0.8):
 
         x[is_masked] = sampled[is_masked]
         
-        # Linear unmasking schedule
+        # Stop diffusion once we reach alpha0 threshold
+        # Or just use the scheduled steps
         remaining_ratio = 1 - (step + 1) / steps
         k = int(remaining_ratio * gen_len)
         if k > 0:
@@ -134,6 +142,26 @@ def generate(model, sp, prompt, steps=64, temperature=0.8):
             masked_conf[~is_masked] = 999
             idx = torch.topk(masked_conf.view(-1), k, largest=False).indices
             x.view(-1)[idx] = cfg.mask_token_id
+
+    # Phase 2: Sequential AR Fill
+    is_masked = (x == cfg.mask_token_id)
+    if is_masked.any():
+        print("Phase 2: Sequential AR Refinement...")
+        # We fill remaining masks one by one, left-to-right
+        mask_indices = torch.where(is_masked[0])[0]
+        for idx in mask_indices:
+            # For AR phase, we can use causal mask or just let it see all previously generated tokens
+            # Paper suggests causal attention for the AR phase
+            causal_bias = get_causal_mask(cfg.seq_len, device)
+            logits = model(x, attn_bias=causal_bias)
+            
+            if temperature > 0:
+                probs = F.softmax(logits[0, idx] / temperature, dim=-1)
+                token = torch.distributions.Categorical(probs).sample()
+            else:
+                token = torch.argmax(logits[0, idx])
+            
+            x[0, idx] = token
             
     return sp.decode(x[0].tolist())
 
