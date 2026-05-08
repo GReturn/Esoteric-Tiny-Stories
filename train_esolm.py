@@ -21,9 +21,9 @@ class Config:
     dropout = 0.1
     batch_size = 256
     lr = 3e-4
-    max_steps = 25000
-    eval_interval = 500
-    eval_iters = 200
+    max_steps = 2000 # Adjusted for batch size 256
+    eval_interval = 200
+    eval_iters = 20 # Much faster validation
     ar_weight = 1.0
     mdm_weight = 1.0
     alpha0 = 0.5
