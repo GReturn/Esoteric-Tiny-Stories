@@ -204,8 +204,11 @@ if __name__ == "__main__":
         spm.SentencePieceTrainer.train(input='tinystories.txt', model_prefix='tinystories_bpe', vocab_size=cfg.vocab_size, user_defined_symbols=['[MASK]'], pad_id=3, unk_id=0, bos_id=1, eos_id=2)
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
+    print("Encoding dataset (Fast)...")
+    import numpy as np
     with open("tinystories.txt", "r", encoding="utf-8") as f: data_text = f.read()
-    all_data = torch.tensor(sp.encode(data_text), dtype=torch.long)
+    tokens = sp.encode(data_text)
+    all_data = torch.from_numpy(np.array(tokens, dtype=np.int32)).long()
     n = int(0.9 * len(all_data))
     train_data, val_data = all_data[:n], all_data[n:]
 
@@ -217,8 +220,9 @@ if __name__ == "__main__":
     steps_list = []
     
     print(f"Starting hybrid training (AR + MDM) on {device}...")
-    print("Graphs will be saved to loss_plot.png (Safe to interrupt with Ctrl+C)")
+    print("Using Mixed Precision (AMP) for 2x speedup.")
     
+    scaler = torch.amp.GradScaler('cuda')
     pbar = tqdm(range(cfg.max_steps))
     try:
         for step in pbar:
@@ -238,31 +242,34 @@ if __name__ == "__main__":
             B, L = x_all.shape
             half_B = B // 2
             
-            # 1. AR component
-            x_ar = x_all[:half_B]
-            causal_bias = get_causal_mask(L, device)
-            logits_ar = model(x_ar, attn_bias=causal_bias)
-            loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_ar[:, 1:].reshape(-1))
-            
-            # 2. MDM component
-            x_mdm_clean = x_all[half_B:]
-            t = torch.randint(1, L, (half_B,), device=device)
-            is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(half_B, L)).bool()
-            x_corrupt = x_mdm_clean.clone()
-            x_corrupt[is_masked] = cfg.mask_token_id
-            
-            if is_masked.any():
-                attn_bias = get_esolm_b_diffusion_mask(is_masked)
-                logits_mdm = model(x_corrupt, attn_bias=attn_bias)
-                loss_mdm_flat = F.cross_entropy(logits_mdm.view(-1, cfg.vocab_size), x_mdm_clean.view(-1), reduction='none')
-                loss_mdm = loss_mdm_flat[is_masked.view(-1)].mean()
-            else:
-                loss_mdm = 0.0 * loss_ar
+            with torch.amp.autocast('cuda'):
+                # 1. AR component
+                x_ar = x_all[:half_B]
+                causal_bias = get_causal_mask(L, device)
+                logits_ar = model(x_ar, attn_bias=causal_bias)
+                loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_ar[:, 1:].reshape(-1))
                 
-            loss = cfg.ar_weight * loss_ar + cfg.mdm_weight * loss_mdm
+                # 2. MDM component
+                x_mdm_clean = x_all[half_B:]
+                t = torch.randint(1, L, (half_B,), device=device)
+                is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(half_B, L)).bool()
+                x_corrupt = x_mdm_clean.clone()
+                x_corrupt[is_masked] = cfg.mask_token_id
+                
+                if is_masked.any():
+                    attn_bias = get_esolm_b_diffusion_mask(is_masked)
+                    logits_mdm = model(x_corrupt, attn_bias=attn_bias)
+                    loss_mdm_flat = F.cross_entropy(logits_mdm.view(-1, cfg.vocab_size), x_mdm_clean.view(-1), reduction='none')
+                    loss_mdm = loss_mdm_flat[is_masked.view(-1)].mean()
+                else:
+                    loss_mdm = 0.0 * loss_ar
+                
+                loss = cfg.ar_weight * loss_ar + cfg.mdm_weight * loss_mdm
+
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving progress...")
