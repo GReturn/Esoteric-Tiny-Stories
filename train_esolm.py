@@ -15,15 +15,16 @@ from dataclasses import dataclass
 class Config:
     vocab_size = 8000
     seq_len = 128
-    n_layers = 6
-    n_heads = 6
-    dim = 384
+    n_layers = 8
+    n_heads = 8
+    dim = 512
     dropout = 0.1
     batch_size = 256
-    lr = 3e-4
-    max_steps = 2000 # Adjusted for batch size 256
+    lr = 5e-4
+    warmup_steps = 100
+    max_steps = 3000
     eval_interval = 200
-    eval_iters = 20 # Much faster validation
+    eval_iters = 20
     ar_weight = 1.0
     mdm_weight = 1.0
     alpha0 = 0.5
@@ -32,6 +33,19 @@ class Config:
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < cfg.warmup_steps:
+        return cfg.lr * it / cfg.warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > cfg.max_steps:
+        return cfg.lr * 0.1
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return cfg.lr * (0.1 + 0.9 * coeff)
 
 # --- Model Components ---
 def rotate_half(x):
@@ -134,18 +148,21 @@ def estimate_loss(model, train_data, val_data):
         losses_ar = torch.zeros(cfg.eval_iters)
         losses_mdm = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
-            x_clean = get_batch(data)
-            B, L = x_clean.shape
+            x_all = get_batch(data)
+            B, L = x_all.shape
+            half_B = B // 2
             
-            # AR Loss
+            # AR
+            x_ar = x_all[:half_B]
             causal_bias = get_causal_mask(L, device)
-            logits_ar = model(x_clean, attn_bias=causal_bias)
-            loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_clean[:, 1:].reshape(-1))
+            logits_ar = model(x_ar, attn_bias=causal_bias)
+            loss_ar = F.cross_entropy(logits_ar[:, :-1, :].reshape(-1, cfg.vocab_size), x_ar[:, 1:].reshape(-1))
             losses_ar[k] = loss_ar.item()
             
-            # MDM Loss
-            t = torch.randint(1, L, (B,), device=device)
-            is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(B, L)).bool()
+            # MDM
+            x_clean = x_all[half_B:]
+            t = torch.randint(1, L, (half_B,), device=device)
+            is_masked = torch.bernoulli((t.float() / L).unsqueeze(1).expand(half_B, L)).bool()
             x_corrupt = x_clean.clone()
             x_corrupt[is_masked] = cfg.mask_token_id
             if is_masked.any():
@@ -216,6 +233,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     
     train_losses, val_losses = [], []
+    train_ar_losses, train_mdm_losses = [], []
     val_ar_losses, val_mdm_losses = [], []
     steps_list = []
     
@@ -226,15 +244,22 @@ if __name__ == "__main__":
     pbar = tqdm(range(cfg.max_steps))
     try:
         for step in pbar:
+            # Set learning rate for this step
+            curr_lr = get_lr(step)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = curr_lr
+
             if step % cfg.eval_interval == 0:
                 losses = estimate_loss(model, train_data, val_data)
                 train_losses.append(losses['train'])
+                train_ar_losses.append(losses['train_ar'])
+                train_mdm_losses.append(losses['train_mdm'])
                 val_losses.append(losses['val'])
                 val_ar_losses.append(losses['val_ar'])
                 val_mdm_losses.append(losses['val_mdm'])
                 steps_list.append(step)
                 
-                pbar.set_description(f"Step {step} | AR: {losses['val_ar']:.4f} | MDM: {losses['val_mdm']:.4f}")
+                pbar.set_description(f"Step {step} | LR: {curr_lr:.2e} | AR: {losses['val_ar']:.4f} | MDM: {losses['val_mdm']:.4f}")
                 print(f"\nSample: {generate_diffusion(model, sp, 'Once upon a time,')}\n")
 
             # Hybrid Step: Split batch into AR and MDM
@@ -278,15 +303,20 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), "esolm_tinystories.pt")
         
         if len(steps_list) > 0:
-            plt.figure(figsize=(10, 6))
-            plt.plot(steps_list, val_ar_losses, label='Val AR (Grammar)', color='blue')
-            plt.plot(steps_list, val_mdm_losses, label='Val MDM (Denoising)', color='green')
-            plt.plot(steps_list, val_losses, label='Total Val Loss', color='red', linestyle='--')
+            plt.figure(figsize=(12, 8))
+            # AR curves
+            plt.plot(steps_list, train_ar_losses, label='Train AR', color='blue', alpha=0.3, linestyle='--')
+            plt.plot(steps_list, val_ar_losses, label='Val AR (Grammar)', color='blue', linewidth=2)
+            # MDM curves
+            plt.plot(steps_list, train_mdm_losses, label='Train MDM', color='green', alpha=0.3, linestyle='--')
+            plt.plot(steps_list, val_mdm_losses, label='Val MDM (Denoising)', color='green', linewidth=2)
+            
+            plt.plot(steps_list, val_losses, label='Total Val Loss', color='black', linewidth=1)
+            
             plt.xlabel('Steps')
             plt.ylabel('Loss')
             plt.legend()
-            plt.title('Eso-LM Faithful Training Progress')
+            plt.title('Eso-LM Training Progress (33.6M Params)')
             plt.grid(True, alpha=0.3)
             plt.savefig('loss_plot.png')
-            print("Final model saved to esolm_tinystories.pt")
-            print("Final loss plot saved to loss_plot.png")
+            print(f"Final model saved. Plot saved with {len(steps_list)} eval points.")
