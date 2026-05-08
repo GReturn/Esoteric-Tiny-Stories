@@ -19,10 +19,10 @@ class Config:
     n_heads = 12
     dim = 768
     dropout = 0.05
-    batch_size = 128
+    batch_size = 64
     lr = 5e-4
-    warmup_steps = 500
-    max_steps = 25000
+    warmup_steps = 1000
+    max_steps = 50000
     eval_interval = 200
     eval_iters = 20
     ar_weight = 1.0
