@@ -19,7 +19,7 @@ class Config:
     n_heads = 6
     dim = 384
     dropout = 0.1
-    batch_size = 64
+    batch_size = 256
     lr = 3e-4
     max_steps = 25000
     eval_interval = 500
