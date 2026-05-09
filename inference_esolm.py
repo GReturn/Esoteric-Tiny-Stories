@@ -4,11 +4,12 @@ import torch.nn.functional as F
 import sentencepiece as spm
 import math
 import numpy as np
+import os
 
 # --- Configuration (Must match train_esolm.py) ---
 class Config:
     vocab_size = 8000
-    seq_len = 128
+    seq_len = 256
     n_layers = 8
     n_heads = 8
     dim = 512
@@ -20,7 +21,7 @@ class Config:
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Architecture (Replicated from train_esolm.py) ---
+# --- Architecture (Strictly synchronized with train_esolm.py) ---
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -51,7 +52,7 @@ def _get_seq_mask(seq_len, device):
     q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
     diagonal = (q_idx2 == kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    offset_causal = (q_idx2 == kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 0)
+    offset_causal = (q_idx2 == kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 0)
     causal = (q_idx2 > kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 1)
     allowed = diagonal | offset_causal | causal
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
@@ -72,8 +73,12 @@ class Attention(nn.Module):
         q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        cos, sin = rotary[..., :self.head_dim].unsqueeze(1), rotary[..., self.head_dim:].unsqueeze(1)
+        
+        # Pull rotary from the shared embeddings passed into forward
+        cos = rotary[..., :self.head_dim].unsqueeze(1)
+        sin = rotary[..., self.head_dim:].unsqueeze(1)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+        
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if attn_mask is not None: att = att + attn_mask.unsqueeze(0).unsqueeze(0)
         att = F.softmax(att, dim=-1)
@@ -87,6 +92,7 @@ class Block(nn.Module):
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
         self.ff = nn.Sequential(nn.Linear(cfg.dim, 4 * cfg.dim), nn.GELU(), nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout))
+        
     def forward(self, x, rotary, attn_mask=None):
         x = x + self.attn(self.ln1(x), rotary, attn_mask)
         x = x + self.ff(self.ln2(x))
@@ -122,6 +128,7 @@ class EsoLM(nn.Module):
         cos_cached = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
         sin_cached = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
         rotary = torch.cat([cos_cached, sin_cached], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
+        
         if diffusion_mode:
             attn_mask = _get_causal_mask(seq_len, zt.device)
             ordering = self._sample_ordering(zt, shuffle_masks=True)
@@ -133,7 +140,10 @@ class EsoLM(nn.Module):
             h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
             rotary_shuffled = self._sort(rotary, ordering)
             rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
-        for block in self.blocks: h_in = block(h_in, rotary_in, attn_mask=attn_mask)
+            
+        for block in self.blocks: 
+            h_in = block(h_in, rotary_in, attn_mask=attn_mask)
+            
         return self.output_layer(self.ln(h_in)), ordering
 
 # --- Specialized Two-Phase Inference ---
@@ -170,18 +180,13 @@ def generate(model, sp, prompt, steps=16, temperature=1.0):
         zt[new_unmasked] = sampled.unsqueeze(0)[new_unmasked]
 
     # --- PHASE 2: SEQUENTIAL (Grammar Polishing) ---
-    # We use z0 (partially filled) and polish left-to-right
     is_masked = (zt == cfg.mask_token_id)
     if is_masked.any():
-        logits, ordering = model(zt, x=zt, diffusion_mode=False) # In Sequential, zt and x are the same start
-        
-        # Grab the zt part of the 2L output
+        logits, ordering = model(zt, x=zt, diffusion_mode=False) 
         logits_seq = logits[:, :cfg.seq_len, :]
-        
         inv_ordering = torch.empty_like(ordering)
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-        
         sampled = torch.argmax(logits_aligned, dim=-1)
         zt[is_masked] = sampled[is_masked]
 
@@ -191,13 +196,21 @@ if __name__ == "__main__":
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
     
+    # Dynamically set the mask token ID from the sp processor
+    cfg.mask_token_id = sp.piece_to_id('[MASK]')
+    
     model = EsoLM().to(device)
+    checkpoint_path = "esolm_checkpoint.pt" if os.path.exists("esolm_checkpoint.pt") else "esolm_faithful.pt"
+    
     try:
-        # Load the faithful checkpoint
-        model.load_state_dict(torch.load("esolm_faithful.pt", weights_only=True))
-        print("Faithful Model loaded successfully.")
+        if os.path.exists(checkpoint_path):
+            model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+            print(f"Model loaded successfully from {checkpoint_path}")
+        else:
+            print("No checkpoint found. Please train the model first.")
     except Exception as e:
         print(f"Error loading model: {e}")
+        print("Architecture mismatch detected. Please delete old .pt files and re-train.")
         
     while True:
         prompt = input("\nEnter prompt (or 'q' to quit): ")

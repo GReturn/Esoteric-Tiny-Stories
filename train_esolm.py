@@ -13,12 +13,12 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     vocab_size = 8000
-    seq_len = 128      # Standard length
+    seq_len = 256      # Upgraded for full stories
     n_layers = 8
     n_heads = 8
     dim = 512
     dropout = 0.1
-    batch_size = 32    # Reduced from 64 to fit the 2L concatenation for Sequential Phase
+    batch_size = 16    # Adjusted for longer sequence length
     lr = 4e-4
     warmup_steps = 2000
     max_steps = 25000
@@ -99,7 +99,6 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(cfg.dim, cfg.dim * 3)
         self.proj = nn.Linear(cfg.dim, cfg.dim)
         self.dropout = nn.Dropout(cfg.dropout)
-        self.rope = RotaryEmbedding(self.head_dim)
         
     def forward(self, x, rotary, attn_mask=None, kv_cache=None):
         B, L, D = x.shape
