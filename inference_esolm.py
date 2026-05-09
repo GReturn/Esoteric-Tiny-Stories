@@ -8,7 +8,7 @@ import os
 
 # --- Configuration (Must match train_esolm.py) ---
 class Config:
-    vocab_size = 8000
+    vocab_size = 10000
     seq_len = 256
     n_layers = 8
     n_heads = 8
@@ -186,16 +186,24 @@ def generate(model, sp, prompt, steps=16, temperature=1.0):
         new_unmasked = to_unmask & is_masked
         zt[new_unmasked] = sampled.unsqueeze(0)[new_unmasked]
 
-    # --- PHASE 2: SEQUENTIAL (Grammar Polishing) ---
-    is_masked = (zt == cfg.mask_token_id)
-    if is_masked.any():
+    # PHASE 2: Iterative Sequential Polishing (Teacher Forcing)
+    # Multiple passes allow the model to correct its own grammar and naming slips.
+    for polish_round in range(3):
+        is_masked = (zt == cfg.mask_token_id)
+        # In the first round, we polish everything. 
+        # In subsequent rounds, we refine the whole sequence to ensure logic holds.
         logits, ordering = model(zt, x=zt, diffusion_mode=False) 
         logits_seq = logits[:, cfg.seq_len:, :]
         inv_ordering = torch.empty_like(ordering)
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-        sampled = torch.argmax(logits_aligned, dim=-1)
-        zt[is_masked] = sampled[is_masked]
+        
+        # We update the sequence with the most likely tokens from the Teacher Forcing pass
+        zt = torch.argmax(logits_aligned, dim=-1)
+        
+        # Keep the original prompt tokens frozen if they were provided
+        if len(tokens) > 0:
+            zt[0, :prompt_len] = torch.tensor(tokens[:prompt_len], device=device)
 
     return sp.decode(zt[0].tolist())
 

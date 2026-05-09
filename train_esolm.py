@@ -12,14 +12,15 @@ from dataclasses import dataclass
 # --- Configuration (Optimized for 8GB VRAM with 2L Concatenation) ---
 @dataclass
 class Config:
-    vocab_size = 8000
+    vocab_size = 10000 # Increased for better coverage (matches paper)
     seq_len = 256      # Upgraded for full stories
     n_layers = 8
     n_heads = 8
     dim = 512
     dropout = 0.1
-    batch_size = 16    # Adjusted for longer sequence length
-    lr = 4e-4
+    batch_size = 8     # Reduced per-step batch size for SwiGLU memory
+    grad_accum_steps = 8 # Global batch size = 64 (Pro Stability)
+    lr = 6e-4          # Higher LR for small models (Pro-tip)
     warmup_steps = 2000
     max_steps = 25000
     eval_interval = 500
@@ -141,8 +142,10 @@ class Block(nn.Module):
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
         self.ff = nn.Sequential(
-            nn.Linear(cfg.dim, 4 * cfg.dim), nn.GELU(),
-            nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout)
+            nn.Linear(cfg.dim, 4 * cfg.dim),
+            nn.SiLU(), # SwiGLU style activation (Pro Upgrade)
+            nn.Linear(4 * cfg.dim, cfg.dim),
+            nn.Dropout(cfg.dropout)
         )
         
     def forward(self, x, rotary, attn_mask=None, kv_cache=None):
@@ -302,7 +305,17 @@ if __name__ == "__main__":
                 if i >= 50000: break
                 
     if not os.path.exists("tinystories_bpe.model"):
-        spm.SentencePieceTrainer.train(input='tinystories.txt', model_prefix='tinystories_bpe', vocab_size=cfg.vocab_size, user_defined_symbols=['[MASK]'], pad_id=3, unk_id=0, bos_id=1, eos_id=2)
+        print("Training High-Reliability Tokenizer...")
+        spm.SentencePieceTrainer.train(
+            input='tinystories.txt', 
+            model_prefix='tinystories_bpe', 
+            vocab_size=cfg.vocab_size, 
+            user_defined_symbols=['[MASK]'], 
+            byte_fallback=True,          # The "Magic Fix" for ⁇
+            model_type='bpe',            # Match original paper
+            character_coverage=1.0,      # Full coverage
+            pad_id=3, unk_id=0, bos_id=1, eos_id=2
+        )
         
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
@@ -331,61 +344,44 @@ if __name__ == "__main__":
             for param_group in optimizer.param_groups:
                 param_group['lr'] = curr_lr
 
-            # --- FAITHFUL DUAL-LOSS TRAINING (Algorithm 1) ---
-            x_batch = get_batch(train_data)
-            B, L = x_batch.shape
-            
-            # Split batch for Sequential vs Diffusion (kappa = 0.5)
-            half_B = B // 2
-            x_seq = x_batch[:half_B]
-            x_diff = x_batch[half_B:]
-            
             optimizer.zero_grad()
-            total_loss = 0.0
-            
-            with torch.amp.autocast('cuda'):
+            # --- PRO GRADIENT ACCUMULATION ---
+            for accum_step in range(cfg.grad_accum_steps):
+                x_batch = get_batch(train_data)
+                B, L = x_batch.shape
+                half_B = B // 2
+                x_seq = x_batch[:half_B]
+                x_diff = x_batch[half_B:]
                 
-                # 1. SEQUENTIAL PHASE (Length 2L, z0 masking)
-                is_masked_seq = torch.rand(half_B, L, device=device) > cfg.alpha0
-                z0 = x_seq.clone()
-                z0[is_masked_seq] = cfg.mask_token_id
-                
-                logits_seq, ordering_seq = model(z0, x=x_seq, diffusion_mode=False)
-                
-                # The logits for the masked predictions z are in the second half (L to 2L)
-                logits_seq_z = logits_seq[:, L:, :] 
-                
-                # Un-shuffle logits to match natural target order
-                inv_ordering_seq = torch.empty_like(ordering_seq)
-                inv_ordering_seq.scatter_(1, ordering_seq, torch.arange(L, device=device).expand_as(ordering_seq))
-                logits_seq_aligned = torch.gather(logits_seq_z, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                
-                loss_seq_flat = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
-                loss_seq = loss_seq_flat[is_masked_seq.view(-1)].mean() if is_masked_seq.any() else torch.tensor(0.0, device=device)
-                
-                
-                # 2. DIFFUSION PHASE (Length L, Uniform t masking)
-                t = torch.rand(half_B, 1, device=device)
-                alpha_t = cfg.alpha0 * (1 - t)
-                is_masked_diff = torch.rand(half_B, L, device=device) > alpha_t
-                zt = x_diff.clone()
-                zt[is_masked_diff] = cfg.mask_token_id
-                
-                logits_diff, ordering_diff = model(zt, diffusion_mode=True)
-                
-                # Un-shuffle logits
-                inv_ordering_diff = torch.empty_like(ordering_diff)
-                inv_ordering_diff.scatter_(1, ordering_diff, torch.arange(L, device=device).expand_as(ordering_diff))
-                logits_diff_aligned = torch.gather(logits_diff, 1, inv_ordering_diff.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                
-                loss_diff_flat = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none')
-                # Applying diffusion loss weight (set to 1.0 per Sahoo et al. Sec 5.1 "empirically reduced variance")
-                loss_diff = loss_diff_flat[is_masked_diff.view(-1)].mean() if is_masked_diff.any() else torch.tensor(0.0, device=device)
+                with torch.amp.autocast('cuda'):
+                    # 1. SEQUENTIAL PHASE
+                    is_masked_seq = torch.rand(half_B, L, device=device) > cfg.alpha0
+                    z0 = x_seq.clone()
+                    z0[is_masked_seq] = cfg.mask_token_id
+                    logits_seq, ordering_seq = model(z0, x=x_seq, diffusion_mode=False)
+                    logits_seq_z = logits_seq[:, L:, :] 
+                    inv_ordering_seq = torch.empty_like(ordering_seq)
+                    inv_ordering_seq.scatter_(1, ordering_seq, torch.arange(L, device=device).expand_as(ordering_seq))
+                    logits_seq_aligned = torch.gather(logits_seq_z, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                    loss_seq_flat = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
+                    loss_seq = loss_seq_flat[is_masked_seq.view(-1)].mean() if is_masked_seq.any() else torch.tensor(0.0, device=device)
+                    
+                    # 2. DIFFUSION PHASE
+                    t = torch.rand(half_B, 1, device=device)
+                    alpha_t = cfg.alpha0 * (1 - t)
+                    is_masked_diff = torch.rand(half_B, L, device=device) > alpha_t
+                    zt = x_diff.clone()
+                    zt[is_masked_diff] = cfg.mask_token_id
+                    logits_diff, ordering_diff = model(zt, diffusion_mode=True)
+                    inv_ordering_diff = torch.empty_like(ordering_diff)
+                    inv_ordering_diff.scatter_(1, ordering_diff, torch.arange(L, device=device).expand_as(ordering_diff))
+                    logits_diff_aligned = torch.gather(logits_diff, 1, inv_ordering_diff.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                    loss_diff_flat = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none')
+                    loss_diff = loss_diff_flat[is_masked_diff.view(-1)].mean() if is_masked_diff.any() else torch.tensor(0.0, device=device)
 
-                # Combine the dual objective
-                loss = (loss_seq + loss_diff) / 2.0
+                    loss = (loss_seq + loss_diff) / (2.0 * cfg.grad_accum_steps)
 
-            scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)

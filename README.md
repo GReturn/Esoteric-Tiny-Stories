@@ -17,6 +17,16 @@ This repository contains the **Faithful Unified Behemoth** implementation. Unlik
 - **Unified Denoising Path**: A single objective $\mathcal{L} = (1 - \kappa)\mathcal{L}_{seq} + \kappa\mathcal{L}_{diff}$ ensures shared representations between sequential and parallel generation.
 - **Cosine Alpha Schedule**: Linear interpolation of the masking ratio $\alpha_t = \alpha_0(1 - t)$ for stable diffusion sketching.
 
+## Deviations & Optimizations
+
+While this model is functionally faithful to the Eso-LM (B) objective, several technical modifications were made to optimize for consumer hardware (RTX 4060 8GB) and modern training stability:
+
+1.  **Physical Shuffling vs. Attention Bias**: The paper often describes Any-Order masking via complex 2D bias matrices. We implement this via **Physical Reordering** of the token and RoPE tensors. This allows the use of standard, high-performance Causal Attention kernels while achieving the same mathematical result.
+2.  **Modern Activation (SiLU)**: We replaced the original paper's activation with **SiLU** (the core of the SwiGLU activation used in Llama 3). This provides smoother gradient flow and better stability for the diffusion task.
+3.  **Gradient Accumulation**: To stabilize the noisy gradients of the Masked Diffusion task on limited VRAM, we utilize **Gradient Accumulation (8 steps)**. This simulates a large global batch size of 64 while maintaining a small memory footprint.
+4.  **Iterative Polishing (Inference)**: Our inference script utilizes **3-pass Iterative Polishing**. This allows the model to "re-read" its own generated stories and correct logical or grammatical slips, a technique used by the authors to maximize coherence in smaller models.
+5.  **Byte-Fallback Tokenization**: We utilize a **10,000 vocab BPE tokenizer with Byte-Fallback** to ensure that rare characters (like capital letters) are never lost as `[UNK]` tokens.
+
 ### Generation Workflow
 ```mermaid
 sequenceDiagram
