@@ -46,22 +46,23 @@ def _get_causal_mask(seq_len, device):
 
 def _get_seq_mask(seq_len, device):
     L = seq_len
-    q_idx = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
+    q_idx  = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
     kv_idx = torch.arange(2*L, device=device).unsqueeze(0).expand(2*L, 2*L)
-    x_flag_q, x_flag_kv = (q_idx >= L).long(), (kv_idx >= L).long()
-    q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
+    x_flag_q  = (q_idx  >= L).long()
+    x_flag_kv = (kv_idx >= L).long()
+    q_idx2  = torch.where(x_flag_q  == 1, q_idx  - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
-    
-    # 1. Causal Mask for Clean Half (Upper Left: x sees x_<=i)
-    diagonal_causal = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    
-    # 2. Teacher Forcing Mask (Lower Left: z_i sees x_<i)
-    teacher_forcing = (q_idx2 > kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 0)
-    
-    # 3. Self-Attention for Noisy Half (Lower Right: z_i sees z_i)
-    self_attn_z = (q_idx2 == kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
-    
-    allowed = diagonal_causal | teacher_forcing | self_attn_z
+
+    # Upper-left: z₀ self-causal (clean tokens, causal by σ)
+    ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
+    # Upper-right: z₀ sees x (teacher signal) — z_i attends to x_<i only
+    ur = (q_idx2 > kv_idx2)  & (x_flag_q == 0) & (x_flag_kv == 1)
+    # Lower-left: x sees z₀ clean tokens
+    ll = (x_flag_q == 1) & (x_flag_kv == 0)
+    # Lower-right: x sees x causally (for AR loss on x)
+    lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+
+    allowed = ul | ur | ll | lr
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
@@ -93,12 +94,24 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
+class FeedForward(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        hidden = int(dim * 8 / 3)
+        hidden = (hidden + 63) // 64 * 64
+        self.w1 = nn.Linear(dim, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+    def forward(self, x):
+        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
 class Block(nn.Module):
     def __init__(self):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
-        self.ff = nn.Sequential(nn.Linear(cfg.dim, 4 * cfg.dim), nn.GELU(), nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout))
+        self.ff = FeedForward(cfg.dim)
         
     def forward(self, x, rotary, attn_mask=None):
         x = x + self.attn(self.ln1(x), rotary, attn_mask)
@@ -111,19 +124,20 @@ class EsoLM(nn.Module):
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block() for _ in range(cfg.n_layers)])
         self.ln = nn.LayerNorm(cfg.dim)
-        self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size)
+        self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.output_layer.weight = self.token_emb.weight
         self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
 
     def _sample_ordering(self, zt, shuffle_masks):
-        masked = (zt == cfg.mask_token_id)
+        masked = (zt == cfg.mask_token_id)          # [B, L]
         offsets = torch.rand(zt.shape, device=zt.device)
         if not shuffle_masks:
-            num_masked = torch.sum(masked, dim=1)
-            for b in range(zt.size(0)):
-                if num_masked[b] > 0:
-                    offsets[b, masked[b]] = torch.linspace(0, 0.99, num_masked[b].item(), device=zt.device)
-        ordering = (masked.float() + offsets).argsort(dim=1)
-        return ordering
+            B, L = zt.shape
+            counts = masked.sum(dim=1, keepdim=True).float().clamp(min=1)
+            cumsum = masked.float().cumsum(dim=1) - 1.0
+            frac = cumsum / counts * 0.99
+            offsets = torch.where(masked, frac, offsets)
+        return (masked.float() + offsets).argsort(dim=1)
 
     def _sort(self, tensor, ordering):
         if tensor.dim() == 2: return torch.gather(tensor, dim=1, index=ordering)
