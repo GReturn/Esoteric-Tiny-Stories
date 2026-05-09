@@ -183,7 +183,7 @@ def generate(model, sp, prompt, steps=16, temperature=1.0):
     is_masked = (zt == cfg.mask_token_id)
     if is_masked.any():
         logits, ordering = model(zt, x=zt, diffusion_mode=False) 
-        logits_seq = logits[:, :cfg.seq_len, :]
+        logits_seq = logits[:, cfg.seq_len:, :]
         inv_ordering = torch.empty_like(ordering)
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))

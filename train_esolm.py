@@ -346,13 +346,13 @@ if __name__ == "__main__":
                 
                 logits_seq, ordering_seq = model(z0, x=x_seq, diffusion_mode=False)
                 
-                # The logits over z0 are in the first half of the 2L sequence
-                logits_seq_z0 = logits_seq[:, :L, :] 
+                # The logits for the masked predictions z are in the second half (L to 2L)
+                logits_seq_z = logits_seq[:, L:, :] 
                 
                 # Un-shuffle logits to match natural target order
                 inv_ordering_seq = torch.empty_like(ordering_seq)
                 inv_ordering_seq.scatter_(1, ordering_seq, torch.arange(L, device=device).expand_as(ordering_seq))
-                logits_seq_aligned = torch.gather(logits_seq_z0, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                logits_seq_aligned = torch.gather(logits_seq_z, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
                 
                 loss_seq_flat = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
                 loss_seq = loss_seq_flat[is_masked_seq.view(-1)].mean() if is_masked_seq.any() else torch.tensor(0.0, device=device)
