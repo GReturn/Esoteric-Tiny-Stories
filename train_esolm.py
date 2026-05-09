@@ -79,11 +79,11 @@ def _get_seq_mask(seq_len, device):
     q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
     
-    # 1. Diagonal Mask (Upper Left)
+    # 1. Diagonal Mask (Upper Left: x sees x)
     diagonal = (q_idx2 == kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # 2. Offset Causal Mask (Upper Right)
-    offset_causal = (q_idx2 == kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 0)
-    # 3. Causal Mask (Lower Right)
+    # 2. Offset Causal Mask (Lower Left: z sees x)
+    offset_causal = (q_idx2 == kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 0)
+    # 3. Causal Mask (Lower Right: z sees z)
     causal = (q_idx2 > kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 1)
     
     allowed = diagonal | offset_causal | causal
@@ -301,6 +301,9 @@ if __name__ == "__main__":
         
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
+    cfg.mask_token_id = sp.piece_to_id('[MASK]')
+    print(f"Using Mask Token ID: {cfg.mask_token_id}")
+    
     import numpy as np
     with open("tinystories.txt", "r", encoding="utf-8") as f: data_text = f.read()
     tokens = sp.encode(data_text)
