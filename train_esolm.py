@@ -1,6 +1,5 @@
 import os
 import math
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,23 +9,24 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 
-# --- Configuration (Optimized for 8GB VRAM) ---
+# --- Configuration (Optimized for 8GB VRAM with 2L Concatenation) ---
 @dataclass
 class Config:
     vocab_size = 8000
-    seq_len = 128
+    seq_len = 128      # Standard length
     n_layers = 8
     n_heads = 8
     dim = 512
-    dropout = 0.05
-    batch_size = 16
-    lr = 3e-4
+    dropout = 0.1
+    batch_size = 32    # Reduced from 64 to fit the 2L concatenation for Sequential Phase
+    lr = 4e-4
     warmup_steps = 2000
     max_steps = 25000
     eval_interval = 500
     eval_iters = 20
     mask_token_id = 0
     pad_token_id = 0
+    alpha0 = 0.5       # The core Eso-LM interpolation hyperparameter
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,14 +40,12 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg.lr * (0.1 + 0.9 * coeff)
 
-# --- Model Components (With KV Caching) ---
+# --- Rotary Embeddings ---
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary(x, cos, sin, position_offset=0):
-    cos = cos[:, :, position_offset:position_offset+x.shape[2], :]
-    sin = sin[:, :, position_offset:position_offset+x.shape[2], :]
+def apply_rotary(x, cos, sin):
     return (x * cos) + (rotate_half(x) * sin)
 
 class RotaryEmbedding(nn.Module):
@@ -61,6 +59,38 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
 
+# --- Faithful Eso-LM Attention Logic (from Appendix B.10) ---
+def _get_causal_mask(seq_len, device):
+    """Standard causal mask used for the physically shuffled Diffusion Phase."""
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
+    return torch.zeros(seq_len, seq_len, device=device).masked_fill(~mask, float('-inf'))
+
+def _get_seq_mask(seq_len, device):
+    """The 2L x 2L specialized mask for Sequential Phase (App. B.7 / Fig 9)."""
+    # PyTorch implementation of the FlexAttention mask described in Figure 9
+    L = seq_len
+    # We create a 2L x 2L mask
+    q_idx = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
+    kv_idx = torch.arange(2*L, device=device).unsqueeze(0).expand(2*L, 2*L)
+    
+    x_flag_q = (q_idx >= L).long()
+    x_flag_kv = (kv_idx >= L).long()
+    
+    q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
+    kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
+    
+    # 1. Diagonal Mask (Upper Left)
+    diagonal = (q_idx2 == kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
+    # 2. Offset Causal Mask (Upper Right)
+    offset_causal = (q_idx2 == kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 0)
+    # 3. Causal Mask (Lower Right)
+    causal = (q_idx2 > kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 1)
+    
+    allowed = diagonal | offset_causal | causal
+    
+    mask = torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
+    return mask
+
 class Attention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -71,7 +101,7 @@ class Attention(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout)
         self.rope = RotaryEmbedding(self.head_dim)
         
-    def forward(self, x, attn_bias=None, kv_cache=None, position_offset=0):
+    def forward(self, x, rotary, attn_mask=None, kv_cache=None):
         B, L, D = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -80,8 +110,11 @@ class Attention(nn.Module):
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         
-        q = apply_rotary(q, self.rope.cos_cached, self.rope.sin_cached, position_offset)
-        k = apply_rotary(k, self.rope.cos_cached, self.rope.sin_cached, position_offset)
+        cos = rotary[..., :self.head_dim].unsqueeze(1)
+        sin = rotary[..., self.head_dim:].unsqueeze(1)
+        
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
         
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
@@ -91,8 +124,8 @@ class Attention(nn.Module):
         new_kv_cache = (k, v)
         
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if attn_bias is not None: 
-            att = att + attn_bias.to(q.dtype)
+        if attn_mask is not None: 
+            att = att + attn_mask.unsqueeze(0).unsqueeze(0)
             
         att = F.softmax(att, dim=-1)
         out = self.dropout(att) @ v
@@ -109,8 +142,8 @@ class Block(nn.Module):
             nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout)
         )
         
-    def forward(self, x, attn_bias=None, kv_cache=None, position_offset=0):
-        attn_out, new_kv_cache = self.attn(self.ln1(x), attn_bias, kv_cache, position_offset)
+    def forward(self, x, rotary, attn_mask=None, kv_cache=None):
+        attn_out, new_kv_cache = self.attn(self.ln1(x), rotary, attn_mask, kv_cache)
         x = x + attn_out
         x = x + self.ff(self.ln2(x))
         return x, new_kv_cache
@@ -121,60 +154,68 @@ class EsoLM(nn.Module):
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block() for _ in range(cfg.n_layers)])
         self.ln = nn.LayerNorm(cfg.dim)
-        self.head = nn.Linear(cfg.dim, cfg.vocab_size)
+        self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size)
+        self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
+
+    def _sample_ordering(self, zt, shuffle_masks):
+        """Faithful physical shuffling logic from Appendix B.10 (Figure 12)"""
+        masked = (zt == cfg.mask_token_id)
+        offsets = torch.rand(zt.shape, device=zt.device)
         
-    def forward(self, x, attn_bias=None, kv_caches=None, position_offset=0):
-        h = self.token_emb(x)
-        new_caches = []
-        for i, block in enumerate(self.blocks):
-            cache_i = kv_caches[i] if kv_caches is not None else None
-            h, new_cache_i = block(h, attn_bias=attn_bias, kv_cache=cache_i, position_offset=position_offset)
-            new_caches.append(new_cache_i)
-        return self.head(self.ln(h)), new_caches
+        if not shuffle_masks:
+            # Induce strict left-to-right natural order within masked tokens for Sequential Phase
+            num_masked = torch.sum(masked, dim=1)
+            for b in range(zt.size(0)):
+                if num_masked[b] > 0:
+                    # Overwrite offsets for masked tokens to be strictly ascending
+                    offsets[b, masked[b]] = torch.linspace(0, 0.99, num_masked[b].item(), device=zt.device)
+                    
+        # Sort puts clean tokens (0 + offset) before mask tokens (1 + offset)
+        ordering = (masked.float() + offsets).argsort(dim=1)
+        return ordering
 
-# --- Unified Permutation Objective Logic ---
-def sample_permutation_mask(B, L, device):
-    """Samples permutation order, applies 30% curriculum, and identifies masked prefix."""
-    # 30% natural order curriculum for stability
-    if random.random() < 0.3:
-        perm = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
-    else:
-        perm = torch.argsort(torch.rand(B, L, device=device), dim=-1)
+    def _sort(self, tensor, ordering):
+        if tensor.dim() == 2:
+            return torch.gather(tensor, dim=1, index=ordering)
+        elif tensor.dim() == 3:
+            return torch.gather(tensor, dim=1, index=ordering.unsqueeze(-1).expand_as(tensor))
 
-    t = torch.randint(1, L, (B,), device=device)
-    rank = torch.argsort(perm, dim=-1)
-    
-    visible = rank < t.unsqueeze(1)
-    is_masked = ~visible
-    return perm, rank, visible, is_masked
+    def forward(self, zt, x=None, diffusion_mode=True):
+        seq_len = zt.shape[1]
+        
+        h_zt = self.token_emb(zt)
+        cos_cached = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
+        sin_cached = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
+        rotary = torch.cat([cos_cached, sin_cached], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
+        
+        if diffusion_mode:
+            attn_mask = _get_causal_mask(seq_len, zt.device)
+            ordering = self._sample_ordering(zt, shuffle_masks=True)
+            
+            # Physically shuffle the tokens and their positional rotaries
+            h_in = self._sort(h_zt, ordering)
+            rotary_in = self._sort(rotary, ordering)
+            
+        else: # Sequential Mode (Requires 2L concatenation!)
+            assert x is not None, "Sequential mode requires clean x for 2L concatenation."
+            attn_mask = _get_seq_mask(seq_len, zt.device)
+            ordering = self._sample_ordering(zt, shuffle_masks=False)
+            
+            h_x = self.token_emb(x)
+            
+            # Concatenate [x_shuffled, zt_shuffled]
+            h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
+            rotary_shuffled = self._sort(rotary, ordering)
+            rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
+            
+        for block in self.blocks:
+            h_in, _ = block(h_in, rotary_in, attn_mask=attn_mask)
+            
+        logits = self.output_layer(self.ln(h_in))
+        
+        return logits, ordering
 
-def get_permutation_attention_bias(rank, visible):
-    """
-    Token i can attend to token j iff j is visible OR rank_j <= rank_i
-    """
-    B, L = rank.shape
-    device = rank.device
-
-    rank_i = rank.unsqueeze(2)
-    rank_j = rank.unsqueeze(1)
-    visible_j = visible.unsqueeze(1).expand(B, L, L)
-
-    allowed = visible_j | (rank_j <= rank_i)
-    
-    # Always allow self-attention
-    eye = torch.eye(L, device=device).bool()
-    allowed = allowed | eye.unsqueeze(0)
-
-    attn_bias = torch.zeros(B, L, L, device=device)
-    attn_bias.masked_fill_(~allowed, float('-inf'))
-    return attn_bias.unsqueeze(1)
-
-def get_causal_mask(T, device):
-    """Used strictly for prefixing during inference."""
-    mask = torch.tril(torch.ones(T, T, device=device)).bool()
-    attn_bias = torch.zeros(T, T, device=device).masked_fill(~mask, float('-inf'))
-    return attn_bias.unsqueeze(0).unsqueeze(0)
-
+# --- Training Utils ---
 def get_batch(data):
     ix = torch.randint(len(data) - cfg.seq_len, (cfg.batch_size,))
     x = torch.stack([data[i : i + cfg.seq_len] for i in ix])
@@ -187,85 +228,64 @@ def estimate_loss(model, train_data, val_data):
     for split, data in [('train', train_data), ('val', val_data)]:
         losses = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
-            x_clean = get_batch(data)
-            B, L = x_clean.shape
+            x_batch = get_batch(data)
+            B, L = x_batch.shape
+            half_B = B // 2
+            x_seq = x_batch[:half_B]
+            x_diff = x_batch[half_B:]
             
-            perm, rank, visible, is_masked = sample_permutation_mask(B, L, device)
-            x_corrupt = x_clean.clone()
-            x_corrupt[is_masked] = cfg.mask_token_id
+            # 1. Sequential Loss
+            is_masked_seq = torch.rand(half_B, L, device=device) > cfg.alpha0
+            z0 = x_seq.clone()
+            z0[is_masked_seq] = cfg.mask_token_id
+            logits_seq, ordering_seq = model(z0, x=x_seq, diffusion_mode=False)
+            logits_seq_z0 = logits_seq[:, :L, :] 
+            inv_ordering_seq = torch.empty_like(ordering_seq)
+            inv_ordering_seq.scatter_(1, ordering_seq, torch.arange(L, device=device).expand_as(ordering_seq))
+            logits_seq_aligned = torch.gather(logits_seq_z0, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+            loss_seq = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
+            l_seq = loss_seq[is_masked_seq.view(-1)].mean() if is_masked_seq.any() else torch.tensor(0.0, device=device)
             
-            attn_bias = get_permutation_attention_bias(rank, visible)
-            logits, _ = model(x_corrupt, attn_bias=attn_bias)
+            # 2. Diffusion Loss
+            t = torch.rand(half_B, 1, device=device)
+            alpha_t = cfg.alpha0 * (1 - t)
+            is_masked_diff = torch.rand(half_B, L, device=device) > alpha_t
+            zt = x_diff.clone()
+            zt[is_masked_diff] = cfg.mask_token_id
+            logits_diff, ordering_diff = model(zt, diffusion_mode=True)
+            inv_ordering_diff = torch.empty_like(ordering_diff)
+            inv_ordering_diff.scatter_(1, ordering_diff, torch.arange(L, device=device).expand_as(ordering_diff))
+            logits_diff_aligned = torch.gather(logits_diff, 1, inv_ordering_diff.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+            loss_diff = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none')
+            l_diff = loss_diff[is_masked_diff.view(-1)].mean() if is_masked_diff.any() else torch.tensor(0.0, device=device)
             
-            loss_flat = F.cross_entropy(logits.view(-1, cfg.vocab_size), x_clean.view(-1), reduction='none')
-            masked_loss = loss_flat[is_masked.view(-1)]
-            
-            # Prevent NaN if completely unmasked (e.g. t == L)
-            losses[k] = masked_loss.mean().item() if masked_loss.numel() > 0 else 0.0
-            
+            losses[k] = (l_seq + l_diff).item() / 2.0
         out[split] = losses.mean().item()
     model.train()
     return out
 
 @torch.no_grad()
-def generate_diffusion(model, sp, prompt, steps=32, temperature=0.0):
-    """Optimized diffusion with exact KV Caching and progressive freezing."""
+def generate_sample(model, sp, prompt="Once upon a time,"):
     model.eval()
     tokens = sp.encode(prompt)
-    L_prompt = len(tokens)
-    gen_len = cfg.seq_len - L_prompt
+    zt = torch.full((1, cfg.seq_len), cfg.mask_token_id, device=device)
+    prompt_len = min(len(tokens), cfg.seq_len)
+    zt[0, :prompt_len] = torch.tensor(tokens[:prompt_len], device=device)
     
-    prompt_tensor = torch.tensor([tokens], device=device)
-    
-    # PREFILL CACHE
-    prompt_mask = get_causal_mask(L_prompt, device)
-    _, kv_caches = model(prompt_tensor, attn_bias=prompt_mask)
-    
-    x_gen = torch.full((1, gen_len), cfg.mask_token_id, device=device)
-    
-    # DIFFUSION DECODING
-    for step in range(steps):
-        is_masked = (x_gen == cfg.mask_token_id)
+    # Simple 4-step diffusion sketch for progress monitoring
+    for step in range(4):
+        is_masked = (zt == cfg.mask_token_id)
         if not is_masked.any(): break
-            
-        # Unmasked tokens are visible. Masked are invisible.
-        B, L_gen = x_gen.shape
-        j_is_unmasked = (~is_masked).unsqueeze(1).expand(B, L_gen, L_gen)
-        allowed = j_is_unmasked | torch.eye(L_gen, device=device).bool().unsqueeze(0)
+        logits, ordering = model(zt, diffusion_mode=True)
+        inv_ordering = torch.empty_like(ordering)
+        inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
+        logits_aligned = torch.gather(logits, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+        sampled = torch.argmax(logits_aligned, dim=-1)
+        # Randomly fill some masks
+        to_fill = torch.rand(1, cfg.seq_len, device=device) > 0.5
+        zt[is_masked & to_fill] = sampled[is_masked & to_fill]
         
-        attn_bias_gen = torch.zeros(B, L_gen, L_gen, device=device).masked_fill_(~allowed, float('-inf')).unsqueeze(1)
-        
-        # Connect generation block back to cached prompt
-        bias_prefix = torch.zeros(1, 1, L_gen, L_prompt, device=device)
-        full_bias = torch.cat([bias_prefix, attn_bias_gen], dim=-1)
-        
-        logits, _ = model(x_gen, attn_bias=full_bias, kv_caches=kv_caches, position_offset=L_prompt)
-        
-        if temperature > 0:
-            probs = F.softmax(logits / temperature, dim=-1)
-            sampled = torch.distributions.Categorical(probs).sample()
-            confidence = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-        else:
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.argmax(logits, dim=-1)
-            confidence = probs.max(dim=-1).values
-            
-        # Propose sampling
-        x_gen[is_masked] = sampled[is_masked]
-        
-        # Cosine scheduling (progressive freezing)
-        remaining_ratio = 0.5 * (1 + math.cos(math.pi * step / steps))
-        candidate_positions = torch.where(is_masked.view(-1))[0]
-        candidate_conf = confidence.view(-1)[candidate_positions]
-        
-        num_to_keep_masked = int(remaining_ratio * candidate_conf.numel())
-        if num_to_keep_masked > 0:
-            keep_masked_idx = torch.topk(candidate_conf, num_to_keep_masked, largest=False).indices
-            # Revert the lowest confidence tokens back to MASK
-            x_gen.view(-1)[candidate_positions[keep_masked_idx]] = cfg.mask_token_id
-            
-    final_sequence = torch.cat([prompt_tensor, x_gen], dim=1)
-    return sp.decode(final_sequence[0].tolist())
+    return sp.decode(zt[0].tolist())
 
 if __name__ == "__main__":
     if not os.path.exists("tinystories.txt"):
@@ -281,7 +301,6 @@ if __name__ == "__main__":
         
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
-    print("Encoding dataset...")
     import numpy as np
     with open("tinystories.txt", "r", encoding="utf-8") as f: data_text = f.read()
     tokens = sp.encode(data_text)
@@ -294,7 +313,7 @@ if __name__ == "__main__":
     
     train_losses, val_losses, steps_list = [], [], []
     
-    print(f"Starting unified Eso-LM training on {device}...")
+    print(f"Starting FAITHFUL Eso-LM Training on {device}...")
     scaler = torch.amp.GradScaler('cuda')
     pbar = tqdm(range(cfg.max_steps))
     
@@ -304,63 +323,88 @@ if __name__ == "__main__":
             for param_group in optimizer.param_groups:
                 param_group['lr'] = curr_lr
 
-            if step % cfg.eval_interval == 0:
-                losses = estimate_loss(model, train_data, val_data)
-                train_losses.append(losses['train'])
-                val_losses.append(losses['val'])
-                steps_list.append(step)
-                
-                pbar.set_description(f"Step {step} | LR: {curr_lr:.2e} | Val Loss: {losses['val']:.4f}")
-                print(f"\nSample: {generate_diffusion(model, sp, 'Once upon a time,')}\n")
-                
-                if step > 0:
-                    torch.save(model.state_dict(), f"esolm_checkpoint.pt")
-
-            # --- UNIFIED TRAINING STEP ---
-            x_clean = get_batch(train_data)
-            B, L = x_clean.shape
+            # --- FAITHFUL DUAL-LOSS TRAINING (Algorithm 1) ---
+            x_batch = get_batch(train_data)
+            B, L = x_batch.shape
             
-            # 1. Sample topology curriculum
-            perm, rank, visible, is_masked = sample_permutation_mask(B, L, device)
+            # Split batch for Sequential vs Diffusion (kappa = 0.5)
+            half_B = B // 2
+            x_seq = x_batch[:half_B]
+            x_diff = x_batch[half_B:]
             
-            # 2. Corrupt inputs
-            x_corrupt = x_clean.clone()
-            x_corrupt[is_masked] = cfg.mask_token_id
-            
-            # 3. Factorized attention map
-            attn_bias = get_permutation_attention_bias(rank, visible)
+            optimizer.zero_grad()
+            total_loss = 0.0
             
             with torch.amp.autocast('cuda'):
-                logits, _ = model(x_corrupt, attn_bias=attn_bias)
-                loss_flat = F.cross_entropy(logits.view(-1, cfg.vocab_size), x_clean.view(-1), reduction='none')
                 
-                # Compute loss exclusively on dynamically masked tokens
-                masked_loss = loss_flat[is_masked.view(-1)]
-                loss = masked_loss.mean() if masked_loss.numel() > 0 else loss_flat.mean() * 0.0
+                # 1. SEQUENTIAL PHASE (Length 2L, z0 masking)
+                is_masked_seq = torch.rand(half_B, L, device=device) > cfg.alpha0
+                z0 = x_seq.clone()
+                z0[is_masked_seq] = cfg.mask_token_id
+                
+                logits_seq, ordering_seq = model(z0, x=x_seq, diffusion_mode=False)
+                
+                # The logits over z0 are in the first half of the 2L sequence
+                logits_seq_z0 = logits_seq[:, :L, :] 
+                
+                # Un-shuffle logits to match natural target order
+                inv_ordering_seq = torch.empty_like(ordering_seq)
+                inv_ordering_seq.scatter_(1, ordering_seq, torch.arange(L, device=device).expand_as(ordering_seq))
+                logits_seq_aligned = torch.gather(logits_seq_z0, 1, inv_ordering_seq.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                
+                loss_seq_flat = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
+                loss_seq = loss_seq_flat[is_masked_seq.view(-1)].mean() if is_masked_seq.any() else torch.tensor(0.0, device=device)
+                
+                
+                # 2. DIFFUSION PHASE (Length L, Uniform t masking)
+                t = torch.rand(half_B, 1, device=device)
+                alpha_t = cfg.alpha0 * (1 - t)
+                is_masked_diff = torch.rand(half_B, L, device=device) > alpha_t
+                zt = x_diff.clone()
+                zt[is_masked_diff] = cfg.mask_token_id
+                
+                logits_diff, ordering_diff = model(zt, diffusion_mode=True)
+                
+                # Un-shuffle logits
+                inv_ordering_diff = torch.empty_like(ordering_diff)
+                inv_ordering_diff.scatter_(1, ordering_diff, torch.arange(L, device=device).expand_as(ordering_diff))
+                logits_diff_aligned = torch.gather(logits_diff, 1, inv_ordering_diff.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                
+                loss_diff_flat = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none')
+                # Applying diffusion loss weight (set to 1.0 per Sahoo et al. Sec 5.1 "empirically reduced variance")
+                loss_diff = loss_diff_flat[is_masked_diff.view(-1)].mean() if is_masked_diff.any() else torch.tensor(0.0, device=device)
 
-            optimizer.zero_grad()
+                # Combine the dual objective
+                loss = (loss_seq + loss_diff) / 2.0
+
             scaler.scale(loss).backward()
-            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
             scaler.step(optimizer)
             scaler.update()
+            
+            if step % cfg.eval_interval == 0:
+                metrics = estimate_loss(model, train_data, val_data)
+                train_losses.append(metrics['train'])
+                val_losses.append(metrics['val'])
+                steps_list.append(step)
+                pbar.set_description(f"Step {step} | Train: {metrics['train']:.3f} | Val: {metrics['val']:.3f}")
+                print(f"\nSample: {generate_sample(model, sp)}\n")
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving progress...")
-
+        print("\nTraining interrupted. Saving...")
     finally:
-        torch.save(model.state_dict(), "esolm_tinystories.pt")
+        torch.save(model.state_dict(), "esolm_faithful.pt")
         
         if len(steps_list) > 0:
+            import matplotlib.pyplot as plt
             plt.figure(figsize=(10, 6))
-            plt.plot(steps_list, train_losses, label='Train NELBO Loss', color='blue', alpha=0.6)
-            plt.plot(steps_list, val_losses, label='Val NELBO Loss', color='red', linewidth=2)
+            plt.plot(steps_list, train_losses, label='Train Loss', color='blue', alpha=0.6)
+            plt.plot(steps_list, val_losses, label='Val Loss', color='red', linewidth=2)
             plt.xlabel('Steps')
             plt.ylabel('Loss')
             plt.legend()
-            plt.title('Eso-LM Unified Training Progress')
+            plt.title('Eso-LM (Faithful) Training Progress')
             plt.grid(True, alpha=0.3)
-            plt.savefig('unified_loss_plot.png')
-            print(f"Final model saved. Plot saved with {len(steps_list)} eval points.")
+            plt.savefig('esolm_faithful_plot.png')
+            print(f"Final model and plot (esolm_faithful_plot.png) saved.")

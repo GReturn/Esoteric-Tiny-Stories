@@ -3,28 +3,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sentencepiece as spm
 import math
-from dataclasses import dataclass
+import numpy as np
 
 # --- Configuration (Must match train_esolm.py) ---
-@dataclass
 class Config:
     vocab_size = 8000
     seq_len = 128
-    n_layers = 12
-    n_heads = 12
-    dim = 768
-    dropout = 0.05
-    alpha0 = 0.5
+    n_layers = 8
+    n_heads = 8
+    dim = 512
+    dropout = 0.1
     mask_token_id = 0
+    pad_token_id = 0
+    alpha0 = 0.5
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Model Components (Must match train_esolm.py) ---
-def get_causal_mask(T, device):
-    mask = torch.tril(torch.ones(T, T, device=device)).bool()
-    attn_bias = torch.zeros(T, T, device=device).masked_fill(~mask, float('-inf'))
-    return attn_bias.unsqueeze(0).unsqueeze(0)
+# --- Architecture (Replicated from train_esolm.py) ---
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -33,15 +29,32 @@ def apply_rotary(x, cos, sin):
     return (x * cos) + (rotate_half(x) * sin)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, max_seq_len=2048):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
-    def forward(self, seq_len):
-        t = torch.arange(seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
+        t = torch.arange(max_seq_len, device=self.inv_freq.device).type_as(self.inv_freq)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos(), emb.sin()
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :])
+
+def _get_causal_mask(seq_len, device):
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
+    return torch.zeros(seq_len, seq_len, device=device).masked_fill(~mask, float('-inf'))
+
+def _get_seq_mask(seq_len, device):
+    L = seq_len
+    q_idx = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
+    kv_idx = torch.arange(2*L, device=device).unsqueeze(0).expand(2*L, 2*L)
+    x_flag_q, x_flag_kv = (q_idx >= L).long(), (kv_idx >= L).long()
+    q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
+    kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
+    diagonal = (q_idx2 == kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
+    offset_causal = (q_idx2 == kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 0)
+    causal = (q_idx2 > kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 1)
+    allowed = diagonal | offset_causal | causal
+    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
     def __init__(self):
@@ -51,21 +64,20 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(cfg.dim, cfg.dim * 3)
         self.proj = nn.Linear(cfg.dim, cfg.dim)
         self.dropout = nn.Dropout(cfg.dropout)
-        self.rope = RotaryEmbedding(self.head_dim)
-    def forward(self, x, attn_bias=None):
+        
+    def forward(self, x, rotary, attn_mask=None):
         B, L, D = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        cos, sin = self.rope(L)
-        cos, sin = cos[None, None, :, :], sin[None, None, :, :]
+        cos, sin = rotary[..., :self.head_dim].unsqueeze(1), rotary[..., self.head_dim:].unsqueeze(1)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if attn_bias is not None: att = att + attn_bias.to(q.dtype)
+        if attn_mask is not None: att = att + attn_mask.unsqueeze(0).unsqueeze(0)
         att = F.softmax(att, dim=-1)
-        out = att @ v
+        out = self.dropout(att) @ v
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
@@ -74,12 +86,9 @@ class Block(nn.Module):
         super().__init__()
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
-        self.ff = nn.Sequential(
-            nn.Linear(cfg.dim, 4 * cfg.dim), nn.GELU(),
-            nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout)
-        )
-    def forward(self, x, attn_bias=None):
-        x = x + self.attn(self.ln1(x), attn_bias=attn_bias)
+        self.ff = nn.Sequential(nn.Linear(cfg.dim, 4 * cfg.dim), nn.GELU(), nn.Linear(4 * cfg.dim, cfg.dim), nn.Dropout(cfg.dropout))
+    def forward(self, x, rotary, attn_mask=None):
+        x = x + self.attn(self.ln1(x), rotary, attn_mask)
         x = x + self.ff(self.ln2(x))
         return x
 
@@ -89,95 +98,111 @@ class EsoLM(nn.Module):
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block() for _ in range(cfg.n_layers)])
         self.ln = nn.LayerNorm(cfg.dim)
-        self.head = nn.Linear(cfg.dim, cfg.vocab_size)
-    def forward(self, x, attn_bias=None):
-        h = self.token_emb(x)
-        for block in self.blocks: h = block(h, attn_bias=attn_bias)
-        return self.head(self.ln(h))
+        self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size)
+        self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
 
-def get_esolm_b_diffusion_mask(is_masked):
-    B, T = is_masked.shape
-    device = is_masked.device
-    rand_keys = torch.rand(B, T, device=device)
-    sort_keys = rand_keys + is_masked.float()
-    sigma_inv = torch.argsort(torch.argsort(sort_keys, dim=1), dim=1)
-    allowed = sigma_inv.unsqueeze(2) >= sigma_inv.unsqueeze(1)
-    attn_bias = torch.zeros(B, T, T, device=device).masked_fill_(~allowed, float('-inf'))
-    return attn_bias.unsqueeze(1)
+    def _sample_ordering(self, zt, shuffle_masks):
+        masked = (zt == cfg.mask_token_id)
+        offsets = torch.rand(zt.shape, device=zt.device)
+        if not shuffle_masks:
+            num_masked = torch.sum(masked, dim=1)
+            for b in range(zt.size(0)):
+                if num_masked[b] > 0:
+                    offsets[b, masked[b]] = torch.linspace(0, 0.99, num_masked[b].item(), device=zt.device)
+        ordering = (masked.float() + offsets).argsort(dim=1)
+        return ordering
 
+    def _sort(self, tensor, ordering):
+        if tensor.dim() == 2: return torch.gather(tensor, dim=1, index=ordering)
+        elif tensor.dim() == 3: return torch.gather(tensor, dim=1, index=ordering.unsqueeze(-1).expand_as(tensor))
+
+    def forward(self, zt, x=None, diffusion_mode=True):
+        seq_len = zt.shape[1]
+        h_zt = self.token_emb(zt)
+        cos_cached = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
+        sin_cached = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
+        rotary = torch.cat([cos_cached, sin_cached], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
+        if diffusion_mode:
+            attn_mask = _get_causal_mask(seq_len, zt.device)
+            ordering = self._sample_ordering(zt, shuffle_masks=True)
+            h_in, rotary_in = self._sort(h_zt, ordering), self._sort(rotary, ordering)
+        else:
+            attn_mask = _get_seq_mask(seq_len, zt.device)
+            ordering = self._sample_ordering(zt, shuffle_masks=False)
+            h_x = self.token_emb(x)
+            h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
+            rotary_shuffled = self._sort(rotary, ordering)
+            rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
+        for block in self.blocks: h_in = block(h_in, rotary_in, attn_mask=attn_mask)
+        return self.output_layer(self.ln(h_in)), ordering
+
+# --- Specialized Two-Phase Inference ---
 @torch.no_grad()
-def generate(model, sp, prompt, steps=16, temperature=0.8):
+def generate(model, sp, prompt, steps=16, temperature=1.0):
     model.eval()
     tokens = sp.encode(prompt)
-    x = torch.tensor([tokens], device=device)
-    B, L0 = x.shape
-    gen_len = cfg.seq_len - L0
-    x = torch.cat([x, torch.full((1, gen_len), cfg.mask_token_id, device=device)], dim=1)
+    if len(tokens) > cfg.seq_len: tokens = tokens[-cfg.seq_len:]
     
-    print(f"Phase 1: Diffusion ({steps} steps)...")
+    # 1. Prepare Initial masked sequence
+    zt = torch.full((1, cfg.seq_len), cfg.mask_token_id, device=device)
+    prompt_len = len(tokens)
+    zt[0, :prompt_len] = torch.tensor(tokens, device=device)
+    
+    # --- PHASE 1: DIFFUSION (Parallel Sketching) ---
     for step in range(steps):
-        is_masked = (x == cfg.mask_token_id)
+        is_masked = (zt == cfg.mask_token_id)
         if not is_masked.any(): break
         
-        # Eso-LM B mask for diffusion
-        attn_bias = get_esolm_b_diffusion_mask(is_masked)
-        logits = model(x, attn_bias=attn_bias)
+        logits, ordering = model(zt, diffusion_mode=True)
         
-        if temperature > 0:
-            probs = F.softmax(logits / temperature, dim=-1)
-            sampled = torch.distributions.Categorical(probs).sample()
-            confidence = probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-        else:
-            probs = F.softmax(logits, dim=-1)
-            sampled = torch.argmax(logits, dim=-1)
-            confidence = probs.max(dim=-1).values
-
-        x[is_masked] = sampled[is_masked]
+        # Un-shuffle logits back to natural sequence order
+        inv_ordering = torch.empty_like(ordering)
+        inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
+        logits_aligned = torch.gather(logits, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
         
-        # Stop diffusion once we reach alpha0 threshold
-        # Or just use the scheduled steps
-        remaining_ratio = 1 - (step + 1) / steps
-        k = int(remaining_ratio * gen_len)
-        if k > 0:
-            masked_conf = confidence.clone()
-            masked_conf[~is_masked] = 999
-            idx = torch.topk(masked_conf.view(-1), k, largest=False).indices
-            x.view(-1)[idx] = cfg.mask_token_id
+        probs = F.softmax(logits_aligned / temperature, dim=-1)
+        sampled = torch.multinomial(probs[0], num_samples=1).squeeze(-1)
+        
+        # Linear annealing of masks
+        threshold = cfg.alpha0 * (1 - (step / steps))
+        to_unmask = torch.rand(1, cfg.seq_len, device=device) > threshold
+        new_unmasked = to_unmask & is_masked
+        zt[new_unmasked] = sampled.unsqueeze(0)[new_unmasked]
 
-    # Phase 2: Sequential AR Fill
-    is_masked = (x == cfg.mask_token_id)
+    # --- PHASE 2: SEQUENTIAL (Grammar Polishing) ---
+    # We use z0 (partially filled) and polish left-to-right
+    is_masked = (zt == cfg.mask_token_id)
     if is_masked.any():
-        print("Phase 2: Sequential AR Refinement...")
-        # We fill remaining masks one by one, left-to-right
-        mask_indices = torch.where(is_masked[0])[0]
-        for idx in mask_indices:
-            # For AR phase, we can use causal mask or just let it see all previously generated tokens
-            # Paper suggests causal attention for the AR phase
-            causal_bias = get_causal_mask(cfg.seq_len, device)
-            logits = model(x, attn_bias=causal_bias)
-            
-            if temperature > 0:
-                probs = F.softmax(logits[0, idx] / temperature, dim=-1)
-                token = torch.distributions.Categorical(probs).sample()
-            else:
-                token = torch.argmax(logits[0, idx])
-            
-            x[0, idx] = token
-            
-    return sp.decode(x[0].tolist())
+        logits, ordering = model(zt, x=zt, diffusion_mode=False) # In Sequential, zt and x are the same start
+        
+        # Grab the zt part of the 2L output
+        logits_seq = logits[:, :cfg.seq_len, :]
+        
+        inv_ordering = torch.empty_like(ordering)
+        inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
+        logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+        
+        sampled = torch.argmax(logits_aligned, dim=-1)
+        zt[is_masked] = sampled[is_masked]
+
+    return sp.decode(zt[0].tolist())
 
 if __name__ == "__main__":
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
     
     model = EsoLM().to(device)
-    model.load_state_dict(torch.load("esolm_tinystories.pt", weights_only=True))
-    print("Model loaded successfully.")
-    
+    try:
+        # Load the faithful checkpoint
+        model.load_state_dict(torch.load("esolm_faithful.pt", weights_only=True))
+        print("Faithful Model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        
     while True:
         prompt = input("\nEnter prompt (or 'q' to quit): ")
         if prompt.lower() == 'q': break
-        result = generate(model, sp, prompt)
+        output = generate(model, sp, prompt)
         print("-" * 30)
-        print(result)
+        print(output)
         print("-" * 30)
