@@ -1,77 +1,63 @@
-# Eso-LM: Esoteric Language Model (Faithful Implementation)
+# Eso-LM: Unified Any-Order Language Model
 
-A 100% faithful implementation of the **Eso-LM (B)** architecture as described in the paper: *"Esoteric Language Models (Eso-LMs): Fusing Autoregressive and Masked Diffusion Models"* (arXiv:2506.01928).
+A high-performance, faithful implementation of the **Eso-LM (B)** architecture as described in the paper: *"Esoteric Language Models (Eso-LMs): Fusing Autoregressive and Masked Diffusion Models"* (arXiv:2506.01928).
 
 ![Eso-LM Architecture](readme/architecture.png)
 
 ## Overview
 
-Eso-LM is a hybrid generative model that bridges the gap between **Autoregressive (AR)** and **Masked Diffusion (MDM)** models. It utilizes a single transformer architecture to perform both parallel sketching and sequential polishing.
+This implementation utilizes a **Unified Denoising Transformer** that bridges the gap between Autoregressive (AR) and Masked Diffusion (MDM) through a single, shared attention mechanism. Unlike standard hybrid models, this version uses a **Unified Permutation Objective** (Any-Order Causal Masking) to train the model.
 
 ### Key Innovations:
-- **Hybrid Training Objective**: Combines causal AR loss and permutation-based MDM loss ($\kappa=0.5$).
-- **Any-Order (AO) Formulation**: Generalizes the training objective to allow for arbitrary token denoising orders.
-- **Two-Phase Generation**: 
-  1. **Phase 1 (Diffusion)**: Parallel generation of tokens to "sketch" the scene (16-32 steps).
-  2. **Phase 2 (Autoregressive)**: Sequential left-to-right generation to "polish" grammar and coherence.
-- **Unified Attention Mechanism**: Uses custom `attn_bias` matrices to support both causal and non-causal masking in the same weights.
+- **Unified Permutation Training**: The model is trained on random permutations of tokens, allowing it to function as both a sequential and parallel generator.
+- **Any-Order (AO) Causal Masking**: A sophisticated attention mechanism where tokens can see all unmasked context plus any tokens that appear "earlier" in the current random permutation.
+- **Exact KV Caching**: Full support for Key-Value caching in both the diffusion sketching phase and the sequential polishing phase, drastically reducing inference latency.
+- **Progressive Freezing (Cosine Scheduling)**: During inference, the model uses a cosine-weighted confidence threshold to decide which tokens to "lock in" at each diffusion step.
+- **Natural Order Curriculum**: Training includes a 30% curriculum of "natural order" (standard AR) to stabilize grammar and long-range coherence.
 
 ### Generation Workflow
 ```mermaid
 sequenceDiagram
     participant U as User Prompt
-    participant D as Phase 1: Diffusion
-    participant A as Phase 2: Autoregressive
+    participant C as KV Cache (Prefill)
+    participant D as Phase 1: Diffusion Sketching
+    participant A as Phase 2: Progressive Freezing
     participant O as Final Story
 
-    U->>D: Initial Sketch Request
-    Note over D: Parallel Denoising (16 steps)
-    D->>D: Fill ~50% of tokens in parallel
-    D->>A: Partially masked sequence (z0)
-    Note over A: Sequential Polishing
-    A->>A: Fill remaining tokens left-to-right
-    A->>O: Coherent, high-quality story
+    U->>C: Encode & Prefill Cache
+    C->>D: Initial [MASK] sequence
+    Note over D: Parallel Denoising with KV Caching
+    D->>A: Propose tokens
+    Note over A: Freeze high-confidence tokens (Cosine Schedule)
+    A->>D: Loop until fully unmasked
+    D->>O: Coherent, high-quality story
 ```
 
 ## Project Structure
 
-- `train_esolm.py`: High-performance training script with Mixed Precision (AMP), Cosine Decay, and Hybrid Loss tracking.
-- `inference_esolm.py`: Two-phase generation script for interactive story completion.
+- `train_esolm.py`: Unified training script using Any-Order Causal masking and BPE tokenization.
+- `inference_esolm.py`: Optimized inference script with KV-cached two-phase generation.
 - `esolm_faithful_roadmap.ipynb`: Research and prototyping notebook.
 
-## Current Configuration (Overnight Behemoth)
+## Current Configuration (VRAM Optimized)
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| **Model Size** | ~96M | 12 Layers, 12 Heads, 768 Dimension |
+| **Model Size** | ~33.6M | 8 Layers, 8 Heads, 512 Dimension |
 | **Vocab** | 8,000 | BPE Tokenizer (SentencePiece) |
-| **Batch Size** | 64 | Optimized for RTX 4060 (8GB VRAM) |
-| **Steps** | 50,000 | Deep training for perfect coherence |
+| **Batch Size** | 16 | Highly stable training for 8GB VRAM |
+| **Steps** | 25,000 | Optimized convergence cycle |
 | **Sequence Len** | 128 | Context window for stories |
 
-## Training Progress Tracking
-
-The model tracks two distinct losses:
-1. **AR Loss**: Measures grammatical correctness and sequential logic.
-2. **MDM Loss**: Measures the ability to fill in blanks and understand global context.
-
-Graphs are automatically saved to `loss_plot.png` after every training run.
-
-### Hybrid Training Logic
+## Training Logic
+The model optimizes the **Negative Evidence Lower Bound (NELBO)** through a unified path:
 ```mermaid
 graph TD
-    Data[Input Sequence] --> Masking{Masking Strategy}
-    Masking -->|AR Path| Causal[Causal Masking]
-    Masking -->|MDM Path| Permute[Permutation Masking]
-    
-    Causal --> Transformer[Unified Transformer Block]
-    Permute --> Transformer
-    
-    Transformer --> AR_Loss[AR Loss: Sequential Logic]
-    Transformer --> MDM_Loss[MDM Loss: Global Context]
-    
-    AR_Loss --> Total[Weighted Hybrid Loss]
-    MDM_Loss --> Total
+    Data[Input Sequence] --> Permute[Sample Random Permutation]
+    Permute --> Mask[Mask Tokens based on Rank T]
+    Mask --> Transformer[Unified Transformer with Permutation Bias]
+    Transformer --> AO_Loss[Any-Order Causal Loss]
+    AO_Loss --> Backprop[Gradient Update with Clipping]
 ```
 
 ## Setup & Usage
