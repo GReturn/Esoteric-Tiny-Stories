@@ -167,10 +167,12 @@ class EsoLM(nn.Module):
         
         if not shuffle_masks:
             # Induce strict left-to-right natural order within masked tokens for Sequential Phase
+            # This matches the authors' 'keep_masks_unshuffled' logic exactly.
             num_masked = torch.sum(masked, dim=1)
             for b in range(zt.size(0)):
                 if num_masked[b] > 0:
-                    # Overwrite offsets for masked tokens to be strictly ascending
+                    # Overwrite offsets for masked tokens to be strictly ascending (0.0 to 0.99)
+                    # This ensures they stay in order at the end of the shuffled sequence.
                     offsets[b, masked[b]] = torch.linspace(0, 0.99, num_masked[b].item(), device=zt.device)
                     
         # Sort puts clean tokens (0 + offset) before mask tokens (1 + offset)
