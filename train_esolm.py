@@ -79,14 +79,18 @@ def _get_seq_mask(seq_len, device):
     q_idx2 = torch.where(x_flag_q == 1, q_idx - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
     
-    # 1. Diagonal Mask (Upper Left: x sees x)
-    diagonal = (q_idx2 == kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # 2. Offset Causal Mask (Lower Left: z sees x)
-    offset_causal = (q_idx2 == kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 0)
-    # 3. Causal Mask (Lower Right: z sees z)
-    causal = (q_idx2 > kv_idx2) & (x_flag_kv == 1) & (x_flag_q == 1)
+    # 1. Causal Mask for Clean Half (Upper Left: x sees x_<=i)
+    diagonal_causal = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
     
-    allowed = diagonal | offset_causal | causal
+    # 2. Teacher Forcing Mask (Lower Left: z_i sees x_<i)
+    # Note: z_i MUST NOT see x_i (its own ground truth) to prevent cheating
+    teacher_forcing = (q_idx2 > kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 0)
+    
+    # 3. Self-Attention for Noisy Half (Lower Right: z_i sees z_i)
+    # In Sequential Phase, z_i primarily relies on clean prefix x_<i
+    self_attn_z = (q_idx2 == kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    
+    allowed = diagonal_causal | teacher_forcing | self_attn_z
     
     mask = torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
     return mask

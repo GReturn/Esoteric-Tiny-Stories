@@ -1,83 +1,70 @@
-# Eso-LM: Unified Any-Order Language Model
+# Eso-LM: Faithful Unified Any-Order Language Model
 
-A high-performance, faithful implementation of the **Eso-LM (B)** architecture as described in the paper: *"Esoteric Language Models (Eso-LMs): Fusing Autoregressive and Masked Diffusion Models"* (arXiv:2506.01928).
+A 100% faithful implementation of the **Eso-LM (B)** architecture as defined in the paper: *"Esoteric Language Models (Eso-LMs): Fusing Autoregressive and Masked Diffusion Models"* (arXiv:2506.01928v3).
 
 ![Eso-LM Architecture](readme/architecture.png)
 
 ## Overview
 
-This implementation utilizes a **Unified Denoising Transformer** that bridges the gap between Autoregressive (AR) and Masked Diffusion (MDM) through a single, shared attention mechanism. Unlike standard hybrid models, this version uses a **Unified Permutation Objective** (Any-Order Causal Masking) to train the model.
+This repository contains the **Faithful Unified Behemoth** implementation. Unlike standard hybrid models that simply interpolate losses, this model utilizes a single, unified transformer block that handles both Autoregressive (AR) and Masked Diffusion (MDM) tasks through specialized physical shuffling and a 2L teacher-forcing attention topology.
 
-### Key Innovations:
-- **Unified Permutation Training**: The model is trained on random permutations of tokens, allowing it to function as both a sequential and parallel generator.
-- **Any-Order (AO) Causal Masking**: A sophisticated attention mechanism where tokens can see all unmasked context plus any tokens that appear "earlier" in the current random permutation.
-- **Exact KV Caching**: Full support for Key-Value caching in both the diffusion sketching phase and the sequential polishing phase, drastically reducing inference latency.
-- **Progressive Freezing (Cosine Scheduling)**: During inference, the model uses a cosine-weighted confidence threshold to decide which tokens to "lock in" at each diffusion step.
-- **Natural Order Curriculum**: Training includes a 30% curriculum of "natural order" (standard AR) to stabilize grammar and long-range coherence.
+### Key Architectural Features:
+- **Physical Shuffling (Appendix B.10)**: Tokens and their **Rotary Positional Embeddings (RoPE)** are physically reordered during training. This allows a standard causal mask to implement the "Any-Order" objective without complex attention bias matrices.
+- **Teacher Forcing 2L Mask (Figure 9)**: A specialized 2L x 2L attention mask used in the Sequential Phase:
+    - **Clean Half ($x$)**: Standard causal attention (Teacher).
+    - **Noisy Half ($z$)**: Tokens attend to the **clean prefix** ($x_{<i}$) and themselves ($z_i$).
+    - This forces the model to learn grammar and logic from ground-truth context while predicting noisy tokens.
+- **Unified Denoising Path**: A single objective $\mathcal{L} = (1 - \kappa)\mathcal{L}_{seq} + \kappa\mathcal{L}_{diff}$ ensures shared representations between sequential and parallel generation.
+- **Cosine Alpha Schedule**: Linear interpolation of the masking ratio $\alpha_t = \alpha_0(1 - t)$ for stable diffusion sketching.
 
 ### Generation Workflow
 ```mermaid
 sequenceDiagram
     participant U as User Prompt
-    participant C as KV Cache (Prefill)
-    participant D as Phase 1: Diffusion Sketching
-    participant A as Phase 2: Progressive Freezing
+    participant D as Phase 1: Diffusion Sketching (Parallel)
+    participant S as Phase 2: Sequential Polishing (Teacher Forcing)
     participant O as Final Story
 
-    U->>C: Encode & Prefill Cache
-    C->>D: Initial [MASK] sequence
-    Note over D: Parallel Denoising with KV Caching
-    D->>A: Propose tokens
-    Note over A: Freeze high-confidence tokens (Cosine Schedule)
-    A->>D: Loop until fully unmasked
-    D->>O: Coherent, high-quality story
+    U->>D: Initial [MASK] sequence
+    Note over D: Physical Shuffling & Causal Masking
+    D->>S: Draft Story
+    Note over S: 2L Teacher Forcing Refinement
+    S->>O: High-Coherence English Story
 ```
 
 ## Project Structure
 
-- `train_esolm.py`: Unified training script using Any-Order Causal masking and BPE tokenization.
-- `inference_esolm.py`: Optimized inference script with KV-cached two-phase generation.
-- `esolm_faithful_roadmap.ipynb`: Research and prototyping notebook.
+- `train_esolm.py`: Core training script implementing the faithful dual-objective and physical shuffling.
+- `inference_esolm.py`: High-performance inference engine with two-phase (Diffusion + Sequential) generation.
+- `README.md`: Technical documentation and architectural overview.
 
-## Current Configuration (VRAM Optimized)
+## Technical Specifications (RTX 4060 Optimized)
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| **Model Size** | ~33.6M | 8 Layers, 8 Heads, 512 Dimension |
-| **Vocab** | 8,000 | BPE Tokenizer (SentencePiece) |
-| **Batch Size** | 16 | Highly stable training for 8GB VRAM |
-| **Steps** | 25,000 | Optimized convergence cycle |
-| **Sequence Len** | 128 | Context window for stories |
-
-## Training Logic
-The model optimizes the **Negative Evidence Lower Bound (NELBO)** through a unified path:
-```mermaid
-graph TD
-    Data[Input Sequence] --> Permute[Sample Random Permutation]
-    Permute --> Mask[Mask Tokens based on Rank T]
-    Mask --> Transformer[Unified Transformer with Permutation Bias]
-    Transformer --> AO_Loss[Any-Order Causal Loss]
-    AO_Loss --> Backprop[Gradient Update with Clipping]
-```
+| **Model Size** | ~33.6M | 8 Layers, 8 Heads, 512 Dim |
+| **Context Length** | 256 | Optimized for full TinyStories coverage |
+| **Batch Size** | 16 | Stable training on 8GB VRAM |
+| **Masking** | $\alpha_0 = 0.5$ | Core Eso-LM interpolation factor |
+| **Optimizer** | AdamW | LR 4e-4 with 2000 step warmup |
 
 ## Setup & Usage
 
-1. **Install Dependencies**:
-   ```bash
-   pip install torch sentencepiece datasets tqdm matplotlib
+1. **Clean Slate (Required if changing architecture)**:
+   ```powershell
+   del esolm_*.pt
    ```
 
-2. **Run Training**:
+2. **Training**:
    ```bash
    python train_esolm.py
    ```
 
-3. **Interactive Inference**:
+3. **Inference**:
    ```bash
    python inference_esolm.py
    ```
 
 ## References
-
-- Eldan, R., & Li, Y. (2023). [TinyStories: How Small Can Language Models Be and Still Speak Coherent English?](https://arxiv.org/abs/2305.07759)
-- [Esoteric Language Models (Eso-LMs)](https://arxiv.org/abs/2506.01928)
+- Sahoo et al. (2025). [Esoteric Language Models (Eso-LMs)](https://arxiv.org/abs/2506.01928)
+- Eldan, R., & Li, Y. (2023). [TinyStories](https://arxiv.org/abs/2305.07759)
