@@ -1,3 +1,6 @@
 .idea/
 Eso-LMs-main
 checkpoints*
+
+__pycache__
+*.pyc
