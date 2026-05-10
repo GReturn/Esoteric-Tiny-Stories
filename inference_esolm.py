@@ -12,7 +12,6 @@ class Config:
     seq_len = 256
     n_layers = 8
     n_heads = 8
-    n_kv_heads = 2
     dim = 512
     dropout = 0.1
     mask_token_id = 0
@@ -21,8 +20,6 @@ class Config:
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
-if torch.cuda.is_available():
-    torch.set_float32_matmul_precision('high')
 
 # --- Architecture (Strictly synchronized with train_esolm.py) ---
 def rotate_half(x):
@@ -56,52 +53,44 @@ def _get_seq_mask(seq_len, device):
     q_idx2  = torch.where(x_flag_q  == 1, q_idx  - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
 
-    # Upper-left: Prefix self-causal
+    # Upper-left: z₀ self-causal (clean tokens, causal by σ)
     ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # Lower-left: Suffix sees Prefix (Teacher)
-    ll = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
-    # Lower-right: Suffix self-causal
+    # Upper-right: z₀ sees x (teacher signal) — z_i attends to x_<i only
+    ur = (q_idx2 > kv_idx2)  & (x_flag_q == 0) & (x_flag_kv == 1)
+    # Lower-left: x sees z₀ clean tokens
+    ll = (x_flag_q == 1) & (x_flag_kv == 0)
+    # Lower-right: x sees x causally (for AR loss on x)
     lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
-    # Upper-right: Prefix sees Suffix (Blocked)
-    ur = False
 
-    allowed = ul | ll | lr
+    allowed = ul | ur | ll | lr
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
     def __init__(self):
         super().__init__()
         self.n_heads = cfg.n_heads
-        self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
-        self.num_groups = self.n_heads // self.n_kv_heads
-        
-        self.q_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.k_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.qkv = nn.Linear(cfg.dim, cfg.dim * 3)
+        self.proj = nn.Linear(cfg.dim, cfg.dim)
         self.dropout = nn.Dropout(cfg.dropout)
         
-    def forward(self, x, rotary, attn_mask=None, is_causal=False):
+    def forward(self, x, rotary, attn_mask=None):
         B, L, D = x.shape
-        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         
-        cos, sin = rotary
+        # Pull rotary from the shared embeddings passed into forward
+        cos = rotary[..., :self.head_dim].unsqueeze(1)
+        sin = rotary[..., self.head_dim:].unsqueeze(1)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         
-        if self.num_groups > 1:
-            k = k.repeat_interleave(self.num_groups, dim=1)
-            v = v.repeat_interleave(self.num_groups, dim=1)
-        
-        out = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=attn_mask, 
-            dropout_p=cfg.dropout if self.training else 0.0,
-            is_causal=is_causal
-        )
-        
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attn_mask is not None: att = att + attn_mask.unsqueeze(0).unsqueeze(0)
+        att = F.softmax(att, dim=-1)
+        out = self.dropout(att) @ v
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
@@ -123,11 +112,9 @@ class Block(nn.Module):
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
         self.ff = FeedForward(cfg.dim)
-        self.attn.proj._is_residual = True
-        self.ff.w2._is_residual = True
         
-    def forward(self, x, rotary, attn_mask=None, is_causal=False):
-        x = x + self.attn(self.ln1(x), rotary, attn_mask, is_causal)
+    def forward(self, x, rotary, attn_mask=None):
+        x = x + self.attn(self.ln1(x), rotary, attn_mask)
         x = x + self.ff(self.ln2(x))
         return x
 
@@ -140,25 +127,9 @@ class EsoLM(nn.Module):
         self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.output_layer.weight = self.token_emb.weight
         self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
-        self._mask_cache = {}
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        n_layers = cfg.n_layers
-        if isinstance(module, nn.Linear):
-            std = 0.02
-            if hasattr(module, '_is_residual'):
-                std = 0.02 / math.sqrt(2 * n_layers)
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None: torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
 
     def _sample_ordering(self, zt, shuffle_masks):
-        masked = (zt == cfg.mask_token_id)
+        masked = (zt == cfg.mask_token_id)          # [B, L]
         offsets = torch.rand(zt.shape, device=zt.device)
         if not shuffle_masks:
             B, L = zt.shape
@@ -175,48 +146,30 @@ class EsoLM(nn.Module):
     def forward(self, zt, x=None, diffusion_mode=True):
         seq_len = zt.shape[1]
         h_zt = self.token_emb(zt)
-        cos = self.rotary_emb.cos_cached[0, 0, :seq_len, :].unsqueeze(1)
-        sin = self.rotary_emb.sin_cached[0, 0, :seq_len, :].unsqueeze(1)
-        rotary = (cos, sin)
+        cos_cached = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
+        sin_cached = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
+        rotary = torch.cat([cos_cached, sin_cached], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
         
-        is_causal = False
         if diffusion_mode:
-            attn_mask = None
-            is_causal = True
+            attn_mask = _get_causal_mask(seq_len, zt.device)
             ordering = self._sample_ordering(zt, shuffle_masks=True)
-            h_in = self._sort(h_zt, ordering)
+            h_in, rotary_in = self._sort(h_zt, ordering), self._sort(rotary, ordering)
         else:
-            if seq_len not in self._mask_cache:
-                self._mask_cache[seq_len] = _get_seq_mask(seq_len, zt.device)
-            attn_mask = self._mask_cache[seq_len]
+            attn_mask = _get_seq_mask(seq_len, zt.device)
             ordering = self._sample_ordering(zt, shuffle_masks=False)
             h_x = self.token_emb(x)
             h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
-            rotary = (cos.repeat(1, 2, 1, 1), sin.repeat(1, 2, 1, 1))
+            rotary_shuffled = self._sort(rotary, ordering)
+            rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
             
         for block in self.blocks: 
-            h_in = block(h_in, rotary, attn_mask=attn_mask, is_causal=is_causal)
+            h_in = block(h_in, rotary_in, attn_mask=attn_mask)
             
         return self.output_layer(self.ln(h_in)), ordering
 
-# --- Top-P (Nucleus) Sampling ---
-def top_p_sampling(logits, p=0.9):
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-    
-    # Remove tokens with cumulative probability above the threshold
-    sorted_indices_to_remove = cumulative_probs > p
-    # Shift the indices to the right to keep also the first token above the threshold
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
-    
-    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-    logits[indices_to_remove] = -float('Inf')
-    return logits
-
 # --- Specialized Two-Phase Inference ---
 @torch.no_grad()
-def generate(model, sp, prompt, steps=16, temperature=0.8, top_p=0.9):
+def generate(model, sp, prompt, steps=16, temperature=1.0):
     model.eval()
     tokens = sp.encode(prompt)
     if len(tokens) > cfg.seq_len: tokens = tokens[-cfg.seq_len:]
@@ -227,7 +180,6 @@ def generate(model, sp, prompt, steps=16, temperature=0.8, top_p=0.9):
     zt[0, :prompt_len] = torch.tensor(tokens, device=device)
     
     # --- PHASE 1: DIFFUSION (Parallel Sketching) ---
-    print("\n[Phase 1: Diffusion Sketching]")
     for step in range(steps):
         is_masked = (zt == cfg.mask_token_id)
         if not is_masked.any(): break
@@ -239,42 +191,33 @@ def generate(model, sp, prompt, steps=16, temperature=0.8, top_p=0.9):
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
         
-        # --- Confidence-Based Unmasking with Top-P ---
-        logits_top = top_p_sampling(logits_aligned[0] / temperature, p=top_p)
-        probs = F.softmax(logits_top, dim=-1)
-        confidences, sampled = torch.max(probs, dim=-1)
+        probs = F.softmax(logits_aligned / temperature, dim=-1)
+        sampled = torch.multinomial(probs[0], num_samples=1).squeeze(-1)
         
-        # Cosine Schedule for unmasking
-        progress = (step + 1) / steps
-        target_unmask_ratio = math.sin(progress * math.pi / 2)
-        
-        n_to_unmask = int(target_unmask_ratio * cfg.seq_len)
-        currently_unmasked = (~is_masked).sum().item()
-        needed = max(0, n_to_unmask - currently_unmasked)
-        
-        if needed > 0:
-            # Select tokens model is most "sure" about
-            conf_masked = confidences.clone()
-            conf_masked[~is_masked[0]] = -1.0 
-            _, idx = torch.topk(conf_masked, k=needed)
-            zt[0, idx] = sampled[idx]
-        
-        print(f"Step {step+1:02d}: {sp.decode(zt[0].tolist())}")
+        # Linear annealing of masks
+        threshold = cfg.alpha0 * (1 - (step / steps))
+        to_unmask = torch.rand(1, cfg.seq_len, device=device) > threshold
+        new_unmasked = to_unmask & is_masked
+        zt[new_unmasked] = sampled.unsqueeze(0)[new_unmasked]
 
     # PHASE 2: Iterative Sequential Polishing (Teacher Forcing)
-    print("\n[Phase 2: Sequential Polishing]")
+    # Multiple passes allow the model to correct its own grammar and naming slips.
     for polish_round in range(3):
+        is_masked = (zt == cfg.mask_token_id)
+        # In the first round, we polish everything. 
+        # In subsequent rounds, we refine the whole sequence to ensure logic holds.
         logits, ordering = model(zt, x=zt, diffusion_mode=False) 
         logits_seq = logits[:, cfg.seq_len:, :]
         inv_ordering = torch.empty_like(ordering)
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
         
+        # We update the sequence with the most likely tokens from the Teacher Forcing pass
         zt = torch.argmax(logits_aligned, dim=-1)
+        
+        # Keep the original prompt tokens frozen if they were provided
         if len(tokens) > 0:
             zt[0, :prompt_len] = torch.tensor(tokens[:prompt_len], device=device)
-        
-        print(f"Round {polish_round+1}: {sp.decode(zt[0].tolist())}")
 
     return sp.decode(zt[0].tolist())
 
@@ -286,7 +229,7 @@ if __name__ == "__main__":
     cfg.mask_token_id = sp.piece_to_id('[MASK]')
     
     model = EsoLM().to(device)
-    checkpoint_path = "esolm_checkpoint.pt" if os.path.exists("esolm_checkpoint.pt") else "esolm_faithful.pt"
+    checkpoint_path = "esolm_checkpoint.pt" if os.path.exists("esolm_checkpoint.pt") else "checkpoints_may10-828pm/esolm_faithful.pt"
     
     try:
         if os.path.exists(checkpoint_path):
