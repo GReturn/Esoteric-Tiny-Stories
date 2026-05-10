@@ -28,6 +28,7 @@ class Config:
     eval_iters = 50
     mask_token_id = 0
     alpha0 = 0.5       
+    n_kv_heads = 2     # GQA: 2 KV heads for 8 Query heads
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -83,29 +84,37 @@ class Attention(nn.Module):
     def __init__(self):
         super().__init__()
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
-        self.qkv = nn.Linear(cfg.dim, cfg.dim * 3)
-        self.proj = nn.Linear(cfg.dim, cfg.dim)
+        self.num_groups = self.n_heads // self.n_kv_heads
+        
+        # Combined projection: [Q, K, V] where K, V are smaller
+        self.q_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.k_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.dropout = nn.Dropout(cfg.dropout)
         
-    def forward(self, x, rotary, attn_mask=None):
+    def forward(self, x, rotary, attn_mask=None, is_causal=False):
         B, L, D = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        
-        cos = rotary[..., :self.head_dim].unsqueeze(1)
-        sin = rotary[..., self.head_dim:].unsqueeze(1)
+        cos, sin = rotary
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+        
+        # GQA: Repeat K, V heads to match Q heads
+        if self.num_groups > 1:
+            k = k.repeat_interleave(self.num_groups, dim=1)
+            v = v.repeat_interleave(self.num_groups, dim=1)
         
         # Use Flash Attention (SDPA)
         out = F.scaled_dot_product_attention(
             q, k, v, 
             attn_mask=attn_mask, 
             dropout_p=cfg.dropout if self.training else 0.0,
-            is_causal=False # Mask handles causality
+            is_causal=is_causal 
         )
         
         out = out.transpose(1, 2).contiguous().view(B, L, D)
@@ -130,9 +139,12 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(cfg.dim)
         self.attn = Attention()
         self.ff = FeedForward(cfg.dim)
+        # Mark for scaled init
+        self.attn.proj._is_residual = True
+        self.ff.w2._is_residual = True
         
-    def forward(self, x, rotary, attn_mask=None):
-        x = x + self.attn(self.ln1(x), rotary, attn_mask)
+    def forward(self, x, rotary, attn_mask=None, is_causal=False):
+        x = x + self.attn(self.ln1(x), rotary, attn_mask, is_causal)
         x = x + self.ff(self.ln2(x))
         return x
 
@@ -145,11 +157,17 @@ class EsoLM(nn.Module):
         self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.output_layer.weight = self.token_emb.weight   # tie weights
         self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
+        self._mask_cache = {}
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        n_layers = cfg.n_layers
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            # GPT-2 style scaled initialization for residual layers
+            if hasattr(module, '_is_residual'):
+                std = 0.02 / math.sqrt(2 * n_layers)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -180,25 +198,31 @@ class EsoLM(nn.Module):
         seq_len = zt.shape[1]
         h_zt = self.token_emb(zt)
         
-        cos = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
-        sin = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
-        rotary = torch.cat([cos, sin], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
+        # Optimized RoPE caching
+        cos = self.rotary_emb.cos_cached[0, 0, :seq_len, :].unsqueeze(1)
+        sin = self.rotary_emb.sin_cached[0, 0, :seq_len, :].unsqueeze(1)
+        rotary = (cos, sin)
         
+        is_causal = False
         if diffusion_mode:
-            attn_mask = _get_causal_mask(seq_len, zt.device)
+            attn_mask = None # Flash Causal handles it
+            is_causal = True
             ordering = self._sample_ordering(zt, shuffle_masks=True)
             h_in = self._sort(h_zt, ordering)
-            rotary_in = self._sort(rotary, ordering)
         else:
-            attn_mask = _get_seq_mask(seq_len, zt.device)
+            # Registry-based mask caching
+            if seq_len not in self._mask_cache:
+                self._mask_cache[seq_len] = _get_seq_mask(seq_len, zt.device)
+            attn_mask = self._mask_cache[seq_len]
+            
             ordering = self._sample_ordering(zt, shuffle_masks=False)
             h_x = self.token_emb(x)
             h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
-            rotary_shuffled = self._sort(rotary, ordering)
-            rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
+            # Duplicate RoPE for the 2L sequence
+            rotary = (cos.repeat(1, 2, 1, 1), sin.repeat(1, 2, 1, 1))
             
         for block in self.blocks:
-            h_in = block(h_in, rotary_in, attn_mask=attn_mask)
+            h_in = block(h_in, rotary, attn_mask=attn_mask, is_causal=is_causal)
             
         return self.output_layer(self.ln(h_in)), ordering
 
@@ -226,18 +250,18 @@ def estimate_loss(model, train_data, val_data):
             x_seq, x_diff = x_batch[:half_B], x_batch[half_B:]
             
             with torch.amp.autocast('cuda'):
-                # Sequential Loss
+                # --- Sequential Loss ---
                 is_m_seq = torch.rand(half_B, cfg.seq_len, device=device) > cfg.alpha0
                 z0 = x_seq.clone()
                 z0[is_m_seq] = cfg.mask_token_id
                 logits_seq, ord_seq = model(z0, x=x_seq, diffusion_mode=False)
                 
-                inv_ord = torch.empty_like(ord_seq).scatter_(1, ord_seq, torch.arange(cfg.seq_len, device=device).expand_as(ord_seq))
-                logits_seq_aligned = torch.gather(logits_seq[:, cfg.seq_len:, :], 1, inv_ord.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                loss_seq = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
-                l_seq = loss_seq[is_m_seq.view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
+                # SHUFFLED-DOMAIN LOSS: Shuffle targets instead of logits
+                x_seq_shuffled = torch.gather(x_seq, 1, ord_seq)
+                l_seq = F.cross_entropy(logits_seq[:, cfg.seq_len:, :].reshape(-1, cfg.vocab_size), x_seq_shuffled.view(-1), reduction='none')
+                l_seq = l_seq[is_m_seq.gather(1, ord_seq).view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
                 
-                # Diffusion Loss
+                # --- Diffusion Loss ---
                 t = sample_t_low_discrepancy(half_B, device).unsqueeze(1)
                 alpha_t = cfg.alpha0 * (1 - t)
                 is_m_diff = torch.rand(half_B, cfg.seq_len, device=device) > alpha_t
@@ -245,15 +269,15 @@ def estimate_loss(model, train_data, val_data):
                 zt[is_m_diff] = cfg.mask_token_id
                 logits_diff, ord_diff = model(zt, diffusion_mode=True)
                 
-                inv_ord_d = torch.empty_like(ord_diff).scatter_(1, ord_diff, torch.arange(cfg.seq_len, device=device).expand_as(ord_diff))
-                logits_diff_aligned = torch.gather(logits_diff, 1, inv_ord_d.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                # SHUFFLED-DOMAIN LOSS: Shuffle targets instead of logits
+                x_diff_shuffled = torch.gather(x_diff, 1, ord_diff)
+                loss_diff_raw = F.cross_entropy(logits_diff.reshape(-1, cfg.vocab_size), x_diff_shuffled.view(-1), reduction='none').view(half_B, cfg.seq_len)
                 
                 # Apply NELBO weight alpha_prime / (1 - alpha_t)
                 alpha_prime = cfg.alpha0
                 weight = alpha_prime / (1.0 - alpha_t)
-                
-                loss_diff_raw = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none').view(half_B, cfg.seq_len)
-                l_diff = (loss_diff_raw * is_m_diff * weight).sum() / is_m_diff.sum().clamp(min=1)
+                is_m_diff_shuffled = is_m_diff.gather(1, ord_diff)
+                l_diff = (loss_diff_raw * is_m_diff_shuffled * weight).sum() / is_m_diff_shuffled.sum().clamp(min=1)
                 
                 losses.append((l_seq + l_diff) / 2.0)
                 
@@ -270,6 +294,7 @@ def generate_sample(model, sp):
         is_m = (zt == cfg.mask_token_id)
         if not is_m.any(): break
         logits, ord = model(zt, diffusion_mode=True)
+        # Un-shuffle back to natural order for sampling
         inv_ord = torch.empty_like(ord).scatter_(1, ord, torch.arange(cfg.seq_len, device=device).expand_as(ord))
         logits_aligned = torch.gather(logits, 1, inv_ord.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
         sampled = torch.argmax(logits_aligned, dim=-1)
@@ -343,17 +368,17 @@ if __name__ == "__main__":
                 x_seq, x_diff = x_batch[:half_B], x_batch[half_B:]
                 
                 with torch.amp.autocast('cuda'):
-                    # Sequential Step
+                    # --- Sequential Step ---
                     is_m_seq = torch.rand(half_B, cfg.seq_len, device=device) > cfg.alpha0
                     z0 = x_seq.clone()
                     z0[is_m_seq] = cfg.mask_token_id
                     logits_seq, ord_seq = model(z0, x=x_seq, diffusion_mode=False)
                     
-                    inv_ord = torch.empty_like(ord_seq).scatter_(1, ord_seq, torch.arange(cfg.seq_len, device=device).expand_as(ord_seq))
-                    logits_seq_aligned = torch.gather(logits_seq[:, cfg.seq_len:, :], 1, inv_ord.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                    l_seq = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')[is_m_seq.view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
+                    x_seq_shuffled = torch.gather(x_seq, 1, ord_seq)
+                    l_seq = F.cross_entropy(logits_seq[:, cfg.seq_len:, :].reshape(-1, cfg.vocab_size), x_seq_shuffled.view(-1), reduction='none')
+                    l_seq = l_seq[is_m_seq.gather(1, ord_seq).view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
                     
-                    # Diffusion Step
+                    # --- Diffusion Step ---
                     t = sample_t_low_discrepancy(half_B, device).unsqueeze(1)
                     alpha_t = cfg.alpha0 * (1 - t)
                     is_m_diff = torch.rand(half_B, cfg.seq_len, device=device) > alpha_t
@@ -361,15 +386,14 @@ if __name__ == "__main__":
                     zt[is_m_diff] = cfg.mask_token_id
                     logits_diff, ord_diff = model(zt, diffusion_mode=True)
                     
-                    inv_ord_d = torch.empty_like(ord_diff).scatter_(1, ord_diff, torch.arange(cfg.seq_len, device=device).expand_as(ord_diff))
-                    logits_diff_aligned = torch.gather(logits_diff, 1, inv_ord_d.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                    x_diff_shuffled = torch.gather(x_diff, 1, ord_diff)
+                    loss_diff_raw = F.cross_entropy(logits_diff.reshape(-1, cfg.vocab_size), x_diff_shuffled.view(-1), reduction='none').view(half_B, cfg.seq_len)
                     
                     # Apply NELBO weight alpha_prime / (1 - alpha_t)
                     alpha_prime = cfg.alpha0
                     weight = alpha_prime / (1.0 - alpha_t)
-                    
-                    loss_diff_raw = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none').view(half_B, cfg.seq_len)
-                    l_diff = (loss_diff_raw * is_m_diff * weight).sum() / is_m_diff.sum().clamp(min=1)
+                    is_m_diff_shuffled = is_m_diff.gather(1, ord_diff)
+                    l_diff = (loss_diff_raw * is_m_diff_shuffled * weight).sum() / is_m_diff_shuffled.sum().clamp(min=1)
                     
                     loss = (l_seq + l_diff) / (2.0 * cfg.grad_accum_steps)
                     

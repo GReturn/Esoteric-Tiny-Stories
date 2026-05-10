@@ -12,6 +12,7 @@ class Config:
     seq_len = 256
     n_layers = 8
     n_heads = 8
+    n_kv_heads = 2
     dim = 512
     dropout = 0.1
     mask_token_id = 0
@@ -57,7 +58,7 @@ def _get_seq_mask(seq_len, device):
 
     # Upper-left: Prefix self-causal
     ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # Lower-left: Suffix sees Prefix (Teacher) — MUST be strictly causal (q > kv) to avoid leakage
+    # Lower-left: Suffix sees Prefix (Teacher)
     ll = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
     # Lower-right: Suffix self-causal
     lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
@@ -66,35 +67,39 @@ def _get_seq_mask(seq_len, device):
 
     allowed = ul | ll | lr
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
-    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
     def __init__(self):
         super().__init__()
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
-        self.qkv = nn.Linear(cfg.dim, cfg.dim * 3)
-        self.proj = nn.Linear(cfg.dim, cfg.dim)
+        self.num_groups = self.n_heads // self.n_kv_heads
+        
+        self.q_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.k_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.dropout = nn.Dropout(cfg.dropout)
         
-    def forward(self, x, rotary, attn_mask=None):
+    def forward(self, x, rotary, attn_mask=None, is_causal=False):
         B, L, D = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.n_kv_heads, self.head_dim).transpose(1, 2)
         
-        q = q.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        
-        cos = rotary[..., :self.head_dim].unsqueeze(1)
-        sin = rotary[..., self.head_dim:].unsqueeze(1)
+        cos, sin = rotary
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         
-        # Use Flash Attention (SDPA)
+        if self.num_groups > 1:
+            k = k.repeat_interleave(self.num_groups, dim=1)
+            v = v.repeat_interleave(self.num_groups, dim=1)
+        
         out = F.scaled_dot_product_attention(
             q, k, v, 
             attn_mask=attn_mask, 
             dropout_p=cfg.dropout if self.training else 0.0,
-            is_causal=False # Mask handles causality
+            is_causal=is_causal
         )
         
         out = out.transpose(1, 2).contiguous().view(B, L, D)
@@ -118,9 +123,11 @@ class Block(nn.Module):
         self.ln1, self.ln2 = nn.LayerNorm(cfg.dim), nn.LayerNorm(cfg.dim)
         self.attn = Attention()
         self.ff = FeedForward(cfg.dim)
+        self.attn.proj._is_residual = True
+        self.ff.w2._is_residual = True
         
-    def forward(self, x, rotary, attn_mask=None):
-        x = x + self.attn(self.ln1(x), rotary, attn_mask)
+    def forward(self, x, rotary, attn_mask=None, is_causal=False):
+        x = x + self.attn(self.ln1(x), rotary, attn_mask, is_causal)
         x = x + self.ff(self.ln2(x))
         return x
 
@@ -133,11 +140,16 @@ class EsoLM(nn.Module):
         self.output_layer = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.output_layer.weight = self.token_emb.weight
         self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
+        self._mask_cache = {}
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        n_layers = cfg.n_layers
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if hasattr(module, '_is_residual'):
+                std = 0.02 / math.sqrt(2 * n_layers)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None: torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -146,7 +158,7 @@ class EsoLM(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     def _sample_ordering(self, zt, shuffle_masks):
-        masked = (zt == cfg.mask_token_id)          # [B, L]
+        masked = (zt == cfg.mask_token_id)
         offsets = torch.rand(zt.shape, device=zt.device)
         if not shuffle_masks:
             B, L = zt.shape
@@ -163,24 +175,27 @@ class EsoLM(nn.Module):
     def forward(self, zt, x=None, diffusion_mode=True):
         seq_len = zt.shape[1]
         h_zt = self.token_emb(zt)
-        cos_cached = self.rotary_emb.cos_cached[0, 0, :seq_len, :]
-        sin_cached = self.rotary_emb.sin_cached[0, 0, :seq_len, :]
-        rotary = torch.cat([cos_cached, sin_cached], dim=-1).unsqueeze(0).expand(zt.shape[0], -1, -1)
+        cos = self.rotary_emb.cos_cached[0, 0, :seq_len, :].unsqueeze(1)
+        sin = self.rotary_emb.sin_cached[0, 0, :seq_len, :].unsqueeze(1)
+        rotary = (cos, sin)
         
+        is_causal = False
         if diffusion_mode:
-            attn_mask = _get_causal_mask(seq_len, zt.device)
+            attn_mask = None
+            is_causal = True
             ordering = self._sample_ordering(zt, shuffle_masks=True)
-            h_in, rotary_in = self._sort(h_zt, ordering), self._sort(rotary, ordering)
+            h_in = self._sort(h_zt, ordering)
         else:
-            attn_mask = _get_seq_mask(seq_len, zt.device)
+            if seq_len not in self._mask_cache:
+                self._mask_cache[seq_len] = _get_seq_mask(seq_len, zt.device)
+            attn_mask = self._mask_cache[seq_len]
             ordering = self._sample_ordering(zt, shuffle_masks=False)
             h_x = self.token_emb(x)
             h_in = torch.cat([self._sort(h_x, ordering), self._sort(h_zt, ordering)], dim=1)
-            rotary_shuffled = self._sort(rotary, ordering)
-            rotary_in = torch.cat([rotary_shuffled, rotary_shuffled], dim=1)
+            rotary = (cos.repeat(1, 2, 1, 1), sin.repeat(1, 2, 1, 1))
             
         for block in self.blocks: 
-            h_in = block(h_in, rotary_in, attn_mask=attn_mask)
+            h_in = block(h_in, rotary, attn_mask=attn_mask, is_causal=is_causal)
             
         return self.output_layer(self.ln(h_in)), ordering
 
