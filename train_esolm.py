@@ -10,6 +10,7 @@ import numpy as np
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import csv
+import re
 
 # --- Configuration (Optimized for 8GB VRAM) ---
 @dataclass
@@ -21,8 +22,8 @@ class Config:
     dim = 512
     dropout = 0.1
     batch_size = 32    
-    grad_accum_steps = 2
-    lr = 6e-4          
+    grad_accum_steps = 8
+    lr = 4e-4          
     warmup_steps = 2000
     max_steps = 5000
     eval_interval = 100
@@ -298,10 +299,27 @@ if __name__ == "__main__":
     if not os.path.exists("tinystories.txt"):
         print("Streaming TinyStories...")
         dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        
+        def clean_story(text):
+            try:
+                # Fix common CP1252-as-UTF8 artifacts (e.g. â€œ -> “)
+                text = text.encode('cp1252').decode('utf-8')
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+            # Normalize whitespace: replace newlines and multiple spaces with a single space
+            text = re.sub(r'\s+', ' ', text)
+            return text.strip()
+
         with open("tinystories.txt", "w", encoding="utf-8") as f:
-            for i, item in enumerate(dataset):
-                f.write(item['text'] + "\n\n")
-                if i >= 50000: break
+            count = 0
+            for item in dataset:
+                story = clean_story(item['text'])
+                # Filter out stories that are obviously cut off (don't end in punctuation)
+                if story.endswith(('.', '!', '?', '"', '”', '’')):
+                    f.write(story + "\n")
+                    count += 1
+                if count >= 50000: break
+        print(f"Saved {count} cleaned stories (one story per line).")
                 
     # 2. Tokenizer Training
     if not os.path.exists("tinystories_bpe.model"):
