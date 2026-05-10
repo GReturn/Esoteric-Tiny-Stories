@@ -325,7 +325,16 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler('cuda')
     
     # 5. Training Loop
-    print(f"Launching Zero-Latency GPU Engine on {device}...")
+    import glob
+    existing_dirs = glob.glob("checkpoints_[0-9][0-9][0-9][0-9]")
+    next_num = 1
+    if existing_dirs:
+        nums = [int(d.split('_')[-1]) for d in existing_dirs]
+        next_num = max(nums) + 1
+    run_dir = f"checkpoints_{next_num:04d}"
+    os.makedirs(run_dir, exist_ok=True)
+    
+    print(f"Launching gpu engine on {device}... Saving to {run_dir}")
     train_losses, val_losses, steps_list = [], [], []
     pbar = tqdm(range(cfg.max_steps))
     
@@ -395,7 +404,7 @@ if __name__ == "__main__":
                 pbar.set_description(f"Step {step} | Loss: {metrics['val']:.3f} | gnorm: {grad_norm:.2f}")
                 print(f"\nSample: {generate_sample(model, sp)}\n")
                 
-                with open('loss_log.csv', 'w', newline='') as f:
+                with open(os.path.join(run_dir, 'loss_log.csv'), 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow(['step', 'train_loss', 'val_loss'])
                     for s, t_l, v_l in zip(steps_list, train_losses, val_losses):
@@ -405,12 +414,12 @@ if __name__ == "__main__":
         print("\nTraining interrupted by user.")
         
     finally:
-        torch.save(model.state_dict(), "esolm_faithful.pt")
+        torch.save(model.state_dict(), os.path.join(run_dir, "esolm_faithful.pt"))
         if len(steps_list) > 1:
             plt.figure(figsize=(10, 6))
             plt.plot(steps_list, train_losses, label='Train')
             plt.plot(steps_list, val_losses, label='Val')
             plt.title("Eso-LM Faithful Training Progress")
             plt.legend()
-            plt.savefig('esolm_faithful_plot.png')
-            print("Final model and plot saved.")
+            plt.savefig(os.path.join(run_dir, 'esolm_faithful_plot.png'))
+            print(f"Final model and plot saved in {run_dir}.")

@@ -229,7 +229,16 @@ if __name__ == "__main__":
     cfg.mask_token_id = sp.piece_to_id('[MASK]')
     
     model = EsoLM().to(device)
-    checkpoint_path = "esolm_checkpoint.pt" if os.path.exists("esolm_checkpoint.pt") else "checkpoints_may10-828pm/esolm_faithful.pt"
+    
+    import glob
+    existing_dirs = glob.glob("checkpoints_[0-9][0-9][0-9][0-9]")
+    if os.path.exists("esolm_checkpoint.pt"):
+        checkpoint_path = "esolm_checkpoint.pt"
+    elif existing_dirs:
+        latest_dir = max(existing_dirs, key=lambda d: int(d.split('_')[-1]))
+        checkpoint_path = os.path.join(latest_dir, "esolm_faithful.pt")
+    else:
+        checkpoint_path = "checkpoints_may10-828pm/esolm_faithful.pt"
     
     try:
         if os.path.exists(checkpoint_path):
