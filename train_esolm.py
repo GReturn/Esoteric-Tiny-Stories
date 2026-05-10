@@ -31,6 +31,8 @@ class Config:
 
 cfg = Config()
 device = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision('high')
 
 # --- Rotary Embeddings ---
 def rotate_half(x):
@@ -65,16 +67,16 @@ def _get_seq_mask(seq_len, device):
     q_idx2  = torch.where(x_flag_q  == 1, q_idx  - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
 
-    # Upper-left: z₀ self-causal (clean tokens, causal by σ)
+    # Upper-left: Prefix self-causal
     ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # Upper-right: z₀ sees x (teacher signal) — z_i attends to x_<i only
-    ur = (q_idx2 > kv_idx2)  & (x_flag_q == 0) & (x_flag_kv == 1)
-    # Lower-left: x sees z₀ clean tokens
-    ll = (x_flag_q == 1) & (x_flag_kv == 0)
-    # Lower-right: x sees x causally (for AR loss on x)
+    # Lower-left: Suffix sees Prefix (Teacher) — MUST be strictly causal (q > kv) to avoid leakage
+    ll = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
+    # Lower-right: Suffix self-causal
     lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    # Upper-right: Prefix sees Suffix (Blocked)
+    ur = False
 
-    allowed = ul | ur | ll | lr
+    allowed = ul | ll | lr
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
@@ -96,16 +98,16 @@ class Attention(nn.Module):
         
         cos = rotary[..., :self.head_dim].unsqueeze(1)
         sin = rotary[..., self.head_dim:].unsqueeze(1)
+        q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        # Use Flash Attention (SDPA)
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=attn_mask, 
+            dropout_p=cfg.dropout if self.training else 0.0,
+            is_causal=False # Mask handles causality
+        )
         
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if attn_mask is not None:
-            att = att + attn_mask
-            
-        att = F.softmax(att, dim=-1)
-        out = self.dropout(att) @ v
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.proj(out)
 
