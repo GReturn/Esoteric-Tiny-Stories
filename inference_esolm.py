@@ -48,21 +48,22 @@ def _get_seq_mask(seq_len, device):
     L = seq_len
     q_idx  = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
     kv_idx = torch.arange(2*L, device=device).unsqueeze(0).expand(2*L, 2*L)
+    
+    # h_in = [x_shuffled, z_shuffled]
     x_flag_q  = (q_idx  >= L).long()
     x_flag_kv = (kv_idx >= L).long()
+    
     q_idx2  = torch.where(x_flag_q  == 1, q_idx  - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
 
-    # Upper-left: z₀ self-causal (clean tokens, causal by σ)
-    ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # Upper-right: z₀ sees x (teacher signal) — z_i attends to x_<i only
-    ur = (q_idx2 > kv_idx2)  & (x_flag_q == 0) & (x_flag_kv == 1)
-    # Lower-left: x sees z₀ clean tokens
-    ll = (x_flag_q == 1) & (x_flag_kv == 0)
-    # Lower-right: x sees x causally (for AR loss on x)
-    lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
-
-    allowed = ul | ur | ll | lr
+    # 1. Clean tokens see clean tokens: x_i attends x_<=i
+    m_xx = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
+    # 2. Teacher forcing: z_i attends x_<i (NO LEAKAGE)
+    m_zx = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
+    # 3. Noisy context: z_i attends z_<=i
+    m_zz = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    
+    allowed = m_xx | m_zx | m_zz
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
@@ -191,7 +192,21 @@ def generate(model, sp, prompt, steps=16, temperature=1.0):
         inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
         logits_aligned = torch.gather(logits, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
         
+        # Sampling with Temperature + Top-P
         probs = F.softmax(logits_aligned / temperature, dim=-1)
+        
+        # Top-P Filtering
+        top_p = 0.95
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        probs = probs.masked_fill(indices_to_remove, 0.0)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        
         sampled = torch.multinomial(probs[0], num_samples=1).squeeze(-1)
         
         # Linear annealing of masks

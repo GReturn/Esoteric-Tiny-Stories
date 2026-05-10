@@ -61,21 +61,30 @@ def _get_seq_mask(seq_len, device):
     L = seq_len
     q_idx  = torch.arange(2*L, device=device).unsqueeze(1).expand(2*L, 2*L)
     kv_idx = torch.arange(2*L, device=device).unsqueeze(0).expand(2*L, 2*L)
+    
+    # h_in = [x_shuffled, z_shuffled]
+    # x_flag == 0 means token is from x (clean)
+    # x_flag == 1 means token is from z (noisy/masked)
     x_flag_q  = (q_idx  >= L).long()
     x_flag_kv = (kv_idx >= L).long()
+    
+    # Position indices within each sequence half
     q_idx2  = torch.where(x_flag_q  == 1, q_idx  - L, q_idx)
     kv_idx2 = torch.where(x_flag_kv == 1, kv_idx - L, kv_idx)
 
-    # Upper-left: z₀ self-causal (clean tokens, causal by σ)
-    ul = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
-    # Upper-right: z₀ sees x (teacher signal) — z_i attends to x_<i only
-    ur = (q_idx2 > kv_idx2)  & (x_flag_q == 0) & (x_flag_kv == 1)
-    # Lower-left: x sees z₀ clean tokens
-    ll = (x_flag_q == 1) & (x_flag_kv == 0)
-    # Lower-right: x sees x causally (for AR loss on x)
-    lr = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    # 1. Clean tokens see clean tokens (AR on x): x_i attends to x_<=i
+    m_xx = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
+    
+    # 2. Teacher forcing: z_i attends to x_<i (CRITICAL: prevents z_i seeing x_i)
+    m_zx = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
+    
+    # 3. Noisy context: z_i attends to z_<=i (causal ordering by σ)
+    m_zz = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    
+    # 4. Cleanup: x does NOT attend to z (avoids seeing future noise)
+    m_xz = False
 
-    allowed = ul | ur | ll | lr
+    allowed = m_xx | m_zx | m_zz | m_xz
     return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
 
 class Attention(nn.Module):
