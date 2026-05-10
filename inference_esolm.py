@@ -5,6 +5,7 @@ import sentencepiece as spm
 import math
 import numpy as np
 import os
+import re
 
 # --- Configuration (Must match train_esolm.py) ---
 class Config:
@@ -60,11 +61,11 @@ def _get_seq_mask(seq_len, device):
     m_xx = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
     # 2. Teacher forcing: z_i attends x_<i (NO LEAKAGE)
     m_zx = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
-    # 3. Noisy context: z_i attends z_<=i
-    m_zz = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    # 3. Noisy context: z_i attends z_<i (STRICT CAUSALITY)
+    m_zz = (q_idx2 > kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
     
     allowed = m_xx | m_zx | m_zz
-    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
+    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, -1e4)
 
 class Attention(nn.Module):
     def __init__(self):
@@ -130,14 +131,14 @@ class EsoLM(nn.Module):
         self.rotary_emb = RotaryEmbedding(cfg.dim // cfg.n_heads)
 
     def _sample_ordering(self, zt, shuffle_masks):
-        masked = (zt == cfg.mask_token_id)          # [B, L]
-        offsets = torch.rand(zt.shape, device=zt.device)
+        B, L = zt.shape
         if not shuffle_masks:
-            B, L = zt.shape
-            counts = masked.sum(dim=1, keepdim=True).float().clamp(min=1)
-            cumsum = masked.float().cumsum(dim=1) - 1.0
-            frac = cumsum / counts * 0.99
-            offsets = torch.where(masked, frac, offsets)
+            # Strictly natural causal order for sequential/polishing tasks
+            return torch.arange(L, device=zt.device).unsqueeze(0).expand(B, L)
+            
+        masked = (zt == cfg.mask_token_id)
+        offsets = torch.rand(zt.shape, device=zt.device)
+        # Any-order diffusion: unmasked first, then masked in random order
         return (masked.float() + offsets).argsort(dim=1)
 
     def _sort(self, tensor, ordering):
@@ -168,75 +169,66 @@ class EsoLM(nn.Module):
             
         return self.output_layer(self.ln(h_in)), ordering
 
-# --- Specialized Two-Phase Inference ---
+# --- High-Coherence Autoregressive Generation ---
 @torch.no_grad()
-def generate(model, sp, prompt, steps=16, temperature=1.0):
+def generate(model, sp, prompt, max_len=200, temperature=0.7, top_k=5, rep_penalty=1.5):
     model.eval()
     tokens = sp.encode(prompt)
     if len(tokens) > cfg.seq_len: tokens = tokens[-cfg.seq_len:]
     
-    # 1. Prepare Initial masked sequence
+    # We will generate one token at a time using the Sequential Stream
     zt = torch.full((1, cfg.seq_len), cfg.mask_token_id, device=device)
     prompt_len = len(tokens)
-    zt[0, :prompt_len] = torch.tensor(tokens, device=device)
+    if prompt_len > 0:
+        zt[0, :prompt_len] = torch.tensor(tokens, device=device)
     
-    # --- PHASE 1: DIFFUSION (Parallel Sketching) ---
-    for step in range(steps):
-        is_masked = (zt == cfg.mask_token_id)
-        if not is_masked.any(): break
+    curr_len = prompt_len
+    eos_id = 2
+    
+    for _ in range(max_len - prompt_len):
+        if curr_len >= cfg.seq_len: break
         
-        logits, ordering = model(zt, diffusion_mode=True)
+        # In Eso-LM Sequential mode, we feed [x, z] where x=z=current_tokens
+        # We use natural order (0, 1, 2...)
+        logits, _ = model(zt, x=zt, diffusion_mode=False)
         
-        # Un-shuffle logits back to natural sequence order
-        inv_ordering = torch.empty_like(ordering)
-        inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
-        logits_aligned = torch.gather(logits, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+        # We look at the prediction for the CURRENT masked position
+        # In the 2L input, the z-stream predictions start at index cfg.seq_len
+        logits_next = logits[0, cfg.seq_len + curr_len, :]
         
-        # Sampling with Temperature + Top-P
-        probs = F.softmax(logits_aligned / temperature, dim=-1)
+        # Repetition Penalty
+        if rep_penalty != 1.0:
+            present_tokens = torch.unique(zt[0, :curr_len])
+            for token in present_tokens:
+                if logits_next[token] > 0:
+                    logits_next[token] /= rep_penalty
+                else:
+                    logits_next[token] *= rep_penalty
         
-        # Top-P Filtering
-        top_p = 0.95
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
+        # Sampling
+        logits_next /= temperature
+        if top_k > 0:
+            v, _ = torch.topk(logits_next, min(top_k, cfg.vocab_size))
+            logits_next[logits_next < v[-1]] = -float('Inf')
+            
+        probs = F.softmax(logits_next, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
         
-        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
-        probs = probs.masked_fill(indices_to_remove, 0.0)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        if next_token == eos_id: break
         
-        sampled = torch.multinomial(probs[0], num_samples=1).squeeze(-1)
-        
-        # Linear annealing of masks
-        threshold = cfg.alpha0 * (1 - (step / steps))
-        to_unmask = torch.rand(1, cfg.seq_len, device=device) > threshold
-        new_unmasked = to_unmask & is_masked
-        zt[new_unmasked] = sampled.unsqueeze(0)[new_unmasked]
+        zt[0, curr_len] = next_token
+        curr_len += 1
 
-    # PHASE 2: Iterative Sequential Polishing (Teacher Forcing)
-    # Multiple passes allow the model to correct its own grammar and naming slips.
-    for polish_round in range(3):
-        is_masked = (zt == cfg.mask_token_id)
-        # In the first round, we polish everything. 
-        # In subsequent rounds, we refine the whole sequence to ensure logic holds.
-        logits, ordering = model(zt, x=zt, diffusion_mode=False) 
-        logits_seq = logits[:, cfg.seq_len:, :]
-        inv_ordering = torch.empty_like(ordering)
-        inv_ordering.scatter_(1, ordering, torch.arange(cfg.seq_len, device=device).expand_as(ordering))
-        logits_aligned = torch.gather(logits_seq, 1, inv_ordering.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-        
-        # We update the sequence with the most likely tokens from the Teacher Forcing pass
-        zt = torch.argmax(logits_aligned, dim=-1)
-        
-        # Keep the original prompt tokens frozen if they were provided
-        if len(tokens) > 0:
-            zt[0, :prompt_len] = torch.tensor(tokens[:prompt_len], device=device)
-
-    return sp.decode(zt[0].tolist())
+    raw_tokens = zt[0, :curr_len].tolist()
+    raw_output = sp.decode(raw_tokens)
+    return re.sub(r'\s+', ' ', raw_output).strip()
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", type=str, default=None)
+    args = parser.parse_args()
+
     sp = spm.SentencePieceProcessor()
     sp.load('tinystories_bpe.model')
     
@@ -265,10 +257,18 @@ if __name__ == "__main__":
         print(f"Error loading model: {e}")
         print("Architecture mismatch detected. Please delete old .pt files and re-train.")
         
-    while True:
-        prompt = input("\nEnter prompt (or 'q' to quit): ")
-        if prompt.lower() == 'q': break
-        output = generate(model, sp, prompt)
+    if args.prompt:
+        output = generate(model, sp, args.prompt)
+        with open("inference_result.txt", "w", encoding="utf-8") as f:
+            f.write(output)
         print("-" * 30)
         print(output)
         print("-" * 30)
+    else:
+        while True:
+            prompt = input("\nEnter prompt (or 'q' to quit): ")
+            if prompt.lower() == 'q': break
+            output = generate(model, sp, prompt)
+            print("-" * 30)
+            print(output)
+            print("-" * 30)

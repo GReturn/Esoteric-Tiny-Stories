@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import csv
 import re
 
-# --- Configuration (Optimized for 8GB VRAM) ---
+# --- Configuration (Speed Optimized for 8GB VRAM / 32GB RAM) ---
 @dataclass
 class Config:
     vocab_size = 10000 
@@ -20,13 +20,13 @@ class Config:
     n_layers = 8
     n_heads = 8
     dim = 512
-    dropout = 0.1
-    batch_size = 32    
-    grad_accum_steps = 8
+    dropout = 0.05     # Slightly lower dropout for faster learning on 50k rows
+    batch_size = 16    
+    grad_accum_steps = 16 
     lr = 4e-4          
-    warmup_steps = 2000
-    max_steps = 5000
-    eval_interval = 100
+    warmup_steps = 500 # Faster warmup for shorter run
+    max_steps = 5000   # 2-hour sprint
+    eval_interval = 100 # More frequent feedback
     eval_iters = 50
     mask_token_id = 0
     alpha0 = 0.5       
@@ -76,17 +76,16 @@ def _get_seq_mask(seq_len, device):
     # 1. Clean tokens see clean tokens (AR on x): x_i attends to x_<=i
     m_xx = (q_idx2 >= kv_idx2) & (x_flag_q == 0) & (x_flag_kv == 0)
     
-    # 2. Teacher forcing: z_i attends to x_<i (CRITICAL: prevents z_i seeing x_i)
+    # 2. Teacher forcing: z_i attends x_<i (STRICT CAUSALITY)
     m_zx = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 0)
-    
-    # 3. Noisy context: z_i attends to z_<=i (causal ordering by σ)
-    m_zz = (q_idx2 >= kv_idx2) & (x_flag_q == 1) & (x_flag_kv == 1)
+    # 3. Noisy context: z_i attends z_<i (NO LEAKAGE)
+    m_zz = (q_idx2 > kv_idx2)  & (x_flag_q == 1) & (x_flag_kv == 1)
     
     # 4. Cleanup: x does NOT attend to z (avoids seeing future noise)
     m_xz = False
 
-    allowed = m_xx | m_zx | m_zz | m_xz
-    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, float('-inf'))
+    allowed = m_xx | m_zx | m_zz
+    return torch.zeros(2*L, 2*L, device=device).masked_fill(~allowed, -1e4)
 
 class Attention(nn.Module):
     def __init__(self):
@@ -235,18 +234,20 @@ def estimate_loss(model, train_data, val_data):
             x_seq, x_diff = x_batch[:half_B], x_batch[half_B:]
             
             with torch.amp.autocast('cuda'):
-                # Sequential Loss
+                # Sequential Loss (Shuffled domain)
                 is_m_seq = torch.rand(half_B, cfg.seq_len, device=device) > cfg.alpha0
                 z0 = x_seq.clone()
                 z0[is_m_seq] = cfg.mask_token_id
                 logits_seq, ord_seq = model(z0, x=x_seq, diffusion_mode=False)
+                logits_z = logits_seq[:, cfg.seq_len:, :]
                 
-                inv_ord = torch.empty_like(ord_seq).scatter_(1, ord_seq, torch.arange(cfg.seq_len, device=device).expand_as(ord_seq))
-                logits_seq_aligned = torch.gather(logits_seq[:, cfg.seq_len:, :], 1, inv_ord.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                loss_seq = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')
-                l_seq = loss_seq[is_m_seq.view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
+                x_shuffled_seq = torch.gather(x_seq, 1, ord_seq)
+                is_m_shuffled_seq = torch.gather(is_m_seq, 1, ord_seq)
                 
-                # Diffusion Loss
+                l_seq = F.cross_entropy(logits_z.reshape(-1, cfg.vocab_size), x_shuffled_seq.view(-1), reduction='none')
+                l_seq = l_seq[is_m_shuffled_seq.view(-1)].mean() if is_m_shuffled_seq.any() else torch.tensor(0.0, device=device)
+                
+                # Diffusion Loss (Shuffled domain)
                 t = sample_t_low_discrepancy(half_B, device).unsqueeze(1)
                 alpha_t = cfg.alpha0 * (1 - t)
                 is_m_diff = torch.rand(half_B, cfg.seq_len, device=device) > alpha_t
@@ -254,15 +255,14 @@ def estimate_loss(model, train_data, val_data):
                 zt[is_m_diff] = cfg.mask_token_id
                 logits_diff, ord_diff = model(zt, diffusion_mode=True)
                 
-                inv_ord_d = torch.empty_like(ord_diff).scatter_(1, ord_diff, torch.arange(cfg.seq_len, device=device).expand_as(ord_diff))
-                logits_diff_aligned = torch.gather(logits_diff, 1, inv_ord_d.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                x_shuffled_diff = torch.gather(x_diff, 1, ord_diff)
+                is_m_shuffled_diff = torch.gather(is_m_diff, 1, ord_diff)
                 
-                # Apply NELBO weight alpha_prime / (1 - alpha_t)
-                alpha_prime = cfg.alpha0
-                weight = alpha_prime / (1.0 - alpha_t)
+                weight = cfg.alpha0 / (1.0 - alpha_t)
+                weight_expanded = weight.expand(-1, cfg.seq_len).reshape(-1)
                 
-                loss_diff_raw = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none').view(half_B, cfg.seq_len)
-                l_diff = (loss_diff_raw * is_m_diff * weight).sum() / is_m_diff.sum().clamp(min=1)
+                loss_diff_raw = F.cross_entropy(logits_diff.reshape(-1, cfg.vocab_size), x_shuffled_diff.view(-1), reduction='none')
+                l_diff = (loss_diff_raw * is_m_shuffled_diff.view(-1) * weight_expanded).sum() / is_m_shuffled_diff.sum().clamp(min=1)
                 
                 losses.append((l_seq + l_diff) / 2.0)
                 
@@ -339,19 +339,31 @@ if __name__ == "__main__":
     sp.load('tinystories_bpe.model')
     cfg.mask_token_id = sp.piece_to_id('[MASK]')
     
-    # 3. Data Pre-loading (to GPU)
-    with open("tinystories.txt", "r", encoding="utf-8") as f: 
-        data_text = f.read()
-    tokens = torch.from_numpy(np.array(sp.encode(data_text), dtype=np.int32)).long().to(device)
+    # 3. Fast & Faithful Data Loading
+    print("Loading tinystories.txt into RAM...")
+    with open("tinystories.txt", "r", encoding="utf-8") as f:
+        stories = [line.strip() for line in f if line.strip()]
+    
+    print(f"Encoding {len(stories)} stories with <EOS> separation...")
+    all_tokens = []
+    eos_id = 2 # From the sentencepiece config above
+    for i, story in enumerate(stories):
+        all_tokens.extend(sp.encode(story))
+        all_tokens.append(eos_id) # Ensure the model knows when a story ends
+        if i % 5000 == 0:
+            print(f"  Progress: {i}/{len(stories)} stories encoded...")
+    
+    tokens = torch.tensor(all_tokens, dtype=torch.long, device=device)
     n = int(0.9 * len(tokens))
     train_data, val_data = tokens[:n], tokens[n:]
+    print(f"Dataset ready: {len(tokens)} total tokens. Memory usage: {tokens.element_size() * tokens.nelement() / 1024 / 1024:.2f} MB on GPU.")
     
     # 4. Model Initialization
     model = EsoLM().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=0.01)
     scaler = torch.amp.GradScaler('cuda')
     
-    # 5. Training Loop
+    # 5. Training Loop Setup
     import glob
     existing_dirs = glob.glob("checkpoints_[0-9][0-9][0-9][0-9]")
     next_num = 1
@@ -362,7 +374,8 @@ if __name__ == "__main__":
     os.makedirs(run_dir, exist_ok=True)
     
     print(f"Launching gpu engine on {device}... Saving to {run_dir}")
-    train_losses, val_losses, steps_list = [], [], []
+    print(">>> Training Started! Monitor the progress bar below.")
+    train_losses, val_losses, steps_list, gnorms = [], [], [], []
     pbar = tqdm(range(cfg.max_steps))
     
     try:
@@ -385,33 +398,41 @@ if __name__ == "__main__":
                 x_seq, x_diff = x_batch[:half_B], x_batch[half_B:]
                 
                 with torch.amp.autocast('cuda'):
-                    # Sequential Step
+                    # --- 1. Sequential Step (Shuffled Domain Loss) ---
                     is_m_seq = torch.rand(half_B, cfg.seq_len, device=device) > cfg.alpha0
                     z0 = x_seq.clone()
                     z0[is_m_seq] = cfg.mask_token_id
+                    
                     logits_seq, ord_seq = model(z0, x=x_seq, diffusion_mode=False)
+                    # Get logits for the 'z' part (second half of 2L)
+                    logits_z = logits_seq[:, cfg.seq_len:, :] # [B, L, V]
                     
-                    inv_ord = torch.empty_like(ord_seq).scatter_(1, ord_seq, torch.arange(cfg.seq_len, device=device).expand_as(ord_seq))
-                    logits_seq_aligned = torch.gather(logits_seq[:, cfg.seq_len:, :], 1, inv_ord.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
-                    l_seq = F.cross_entropy(logits_seq_aligned.reshape(-1, cfg.vocab_size), x_seq.view(-1), reduction='none')[is_m_seq.view(-1)].mean() if is_m_seq.any() else torch.tensor(0.0, device=device)
+                    # Instead of aligning logits (slow), shuffle targets (fast)
+                    x_shuffled_seq = torch.gather(x_seq, 1, ord_seq)
+                    is_m_shuffled_seq = torch.gather(is_m_seq, 1, ord_seq)
                     
-                    # Diffusion Step
+                    # Calculate loss only on masked tokens in shuffled domain
+                    l_seq = F.cross_entropy(logits_z.reshape(-1, cfg.vocab_size), x_shuffled_seq.view(-1), reduction='none')
+                    l_seq = l_seq[is_m_shuffled_seq.view(-1)].mean() if is_m_shuffled_seq.any() else torch.tensor(0.0, device=device)
+                    
+                    # --- 2. Diffusion Step (Shuffled Domain Loss) ---
                     t = sample_t_low_discrepancy(half_B, device).unsqueeze(1)
                     alpha_t = cfg.alpha0 * (1 - t)
                     is_m_diff = torch.rand(half_B, cfg.seq_len, device=device) > alpha_t
                     zt = x_diff.clone()
                     zt[is_m_diff] = cfg.mask_token_id
-                    logits_diff, ord_diff = model(zt, diffusion_mode=True)
                     
-                    inv_ord_d = torch.empty_like(ord_diff).scatter_(1, ord_diff, torch.arange(cfg.seq_len, device=device).expand_as(ord_diff))
-                    logits_diff_aligned = torch.gather(logits_diff, 1, inv_ord_d.unsqueeze(-1).expand(-1, -1, cfg.vocab_size))
+                    logits_diff, ord_diff = model(zt, diffusion_mode=True)
+                    # ord_diff is [B, L] - it's the physical shuffling order
+                    x_shuffled_diff = torch.gather(x_diff, 1, ord_diff)
+                    is_m_shuffled_diff = torch.gather(is_m_diff, 1, ord_diff)
                     
                     # Apply NELBO weight alpha_prime / (1 - alpha_t)
-                    alpha_prime = cfg.alpha0
-                    weight = alpha_prime / (1.0 - alpha_t)
+                    weight = cfg.alpha0 / (1.0 - alpha_t) # [B, 1]
+                    weight_expanded = weight.expand(-1, cfg.seq_len).reshape(-1)
                     
-                    loss_diff_raw = F.cross_entropy(logits_diff_aligned.reshape(-1, cfg.vocab_size), x_diff.view(-1), reduction='none').view(half_B, cfg.seq_len)
-                    l_diff = (loss_diff_raw * is_m_diff * weight).sum() / is_m_diff.sum().clamp(min=1)
+                    loss_diff_raw = F.cross_entropy(logits_diff.reshape(-1, cfg.vocab_size), x_shuffled_diff.view(-1), reduction='none')
+                    l_diff = (loss_diff_raw * is_m_shuffled_diff.view(-1) * weight_expanded).sum() / is_m_shuffled_diff.sum().clamp(min=1)
                     
                     loss = (l_seq + l_diff) / (2.0 * cfg.grad_accum_steps)
                     
@@ -423,19 +444,20 @@ if __name__ == "__main__":
             scaler.update()
             
             # Monitoring
-            if step % cfg.eval_interval == 0:
+            if step > 0 and step % cfg.eval_interval == 0:
                 metrics = estimate_loss(model, train_data, val_data)
                 train_losses.append(metrics['train'])
                 val_losses.append(metrics['val'])
+                gnorms.append(grad_norm.item())
                 steps_list.append(step)
                 pbar.set_description(f"Step {step} | Loss: {metrics['val']:.3f} | gnorm: {grad_norm:.2f}")
                 print(f"\nSample: {generate_sample(model, sp)}\n")
                 
                 with open(os.path.join(run_dir, 'loss_log.csv'), 'w', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['step', 'train_loss', 'val_loss'])
-                    for s, t_l, v_l in zip(steps_list, train_losses, val_losses):
-                        writer.writerow([s, t_l, v_l])
+                    writer.writerow(['step', 'train_loss', 'val_loss', 'gnorm'])
+                    for s, t_l, v_l, gn in zip(steps_list, train_losses, val_losses, gnorms):
+                        writer.writerow([s, t_l, v_l, gn])
                 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
@@ -443,10 +465,25 @@ if __name__ == "__main__":
     finally:
         torch.save(model.state_dict(), os.path.join(run_dir, "esolm_faithful.pt"))
         if len(steps_list) > 1:
-            plt.figure(figsize=(10, 6))
-            plt.plot(steps_list, train_losses, label='Train')
-            plt.plot(steps_list, val_losses, label='Val')
-            plt.title("Eso-LM Faithful Training Progress")
-            plt.legend()
-            plt.savefig(os.path.join(run_dir, 'esolm_faithful_plot.png'))
-            print(f"Final model and plot saved in {run_dir}.")
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+            
+            # Loss Plot
+            ax1.plot(steps_list, train_losses, label='Train Loss', color='blue')
+            ax1.plot(steps_list, val_losses, label='Val Loss', color='red')
+            ax1.set_title("Eso-LM Training Progress: Loss")
+            ax1.set_xlabel("Step")
+            ax1.set_ylabel("Cross Entropy")
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Gnorm Plot
+            ax2.plot(steps_list, gnorms, label='Gradient Norm', color='green')
+            ax2.set_title("Training Stability: Gradient Norm")
+            ax2.set_xlabel("Step")
+            ax2.set_ylabel("Norm Value")
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(run_dir, 'esolm_training_report.png'))
+            print(f"Final model and training report saved in {run_dir}.")
