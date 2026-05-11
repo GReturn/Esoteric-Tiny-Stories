@@ -53,6 +53,22 @@ To enable training of this Hugh Mungus architecture on consumer hardware (8GB VR
 
 ---
 
+## 📈 Performance & Benchmarks
+
+The model was evaluated on the **TinyStories** validation set after 5,000 steps of training.
+
+### 1. Training Metrics
+![Training Performance](readme/training_performance.png)
+
+### 2. Quantitative Results
+| Metric | Result | Context |
+| :--- | :--- | :--- |
+| **Top-1 Accuracy (AR)** | **46.38%** | Exact match on next-token prediction. |
+| **Mask Recon Rate** | **8.14%** | Direct single-pass reconstruction of masked tokens. |
+| **Inference Throughput** | **47,379.9 t/s** | Tokens per second (measured on RTX 4060). |
+
+---
+
 ## Getting Started
 
 ### Training
