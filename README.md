@@ -8,7 +8,7 @@ A high-fidelity implementation of the **Eso-LM (Variant B)** architecture. This 
 
 ---
 
-## 🏛️ Architectural Faithfulness
+## Architectural Faithfulness
 
 This implementation is mathematically aligned with the **Eso-LM (B)** setup described in *"Esoteric Language Models: Bridging Autoregressive and Masked Diffusion LLMs"* (arXiv:2506.01928).
 
@@ -30,9 +30,9 @@ Instead of complex attention bias matrices, we utilize **Physical Reordering**. 
 
 ---
 
-## ⚡ Performance Optimizations
+## Performance Optimizations
 
-To enable training of this "Behemoth" architecture on consumer hardware (8GB VRAM), several industrial optimizations were implemented:
+To enable training of this Hugh Mungus architecture on consumer hardware (8GB VRAM), several industrial optimizations were implemented:
 
 *   **Shuffled-Domain Loss**: Instead of aligning model logits (a $B \times L \times V$ operation), we shuffle the training targets to match the physical token order. This drastically reduces VRAM overhead.
 *   **Zero-Latency Data Engine**: A GPU-native vectorized engine that prepares batches in VRAM, eliminating CPU bottlenecks during the diffusion noise sampling.
@@ -40,7 +40,7 @@ To enable training of this "Behemoth" architecture on consumer hardware (8GB VRA
 
 ---
 
-## 📊 Technical Specifications
+## Technical Specifications
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
@@ -53,7 +53,7 @@ To enable training of this "Behemoth" architecture on consumer hardware (8GB VRA
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Training
 The training script handles dataset streaming, BPE training, and the dual-objective training loop.
@@ -69,6 +69,6 @@ python inference_esolm.py
 
 ---
 
-## 📜 References
+## References
 - Sahoo et al. (2025). [Esoteric Language Models (Eso-LMs)](https://arxiv.org/abs/2506.01928)
 - Eldan & Li (2023). [TinyStories: How Small Can Language Models Be?](https://arxiv.org/abs/2305.07759)
