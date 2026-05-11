@@ -1,80 +1,74 @@
-# Eso-LM: Faithful Unified Any-Order Language Model
+# Eso-LM: Bridging Autoregressive and Masked Diffusion LLMs
 
-A 100% faithful implementation of the **Eso-LM (B)** architecture as defined in the paper: *"Esoteric Language Models (Eso-LMs): Fusing Autoregressive and Masked Diffusion Models"* (arXiv:2506.01928v3).
+[![Paper](https://img.shields.io/badge/arXiv-2506.01928-B31B1B.svg)](https://arxiv.org/abs/2506.01928)
+[![Model](https://img.shields.io/badge/Architecture-Eso--LM%20(B)-blue.svg)](#)
+[![Hardware](https://img.shields.io/badge/VRAM-8GB%20Optimized-green.svg)](#)
 
-![Eso-LM Architecture](readme/architecture.png)
+A high-fidelity implementation of the **Eso-LM (Variant B)** architecture. This model fuses Autoregressive (AR) and Masked Diffusion Model (MDM) paradigms into a single transformer backbone, enabling both exact likelihood computation and efficient KV-cached inference.
 
-## Overview
+---
 
-This repository contains the **Faithful Unified Behemoth** implementation. Unlike standard hybrid models that simply interpolate losses, this model utilizes a single, unified transformer block that handles both Autoregressive (AR) and Masked Diffusion (MDM) tasks through specialized physical shuffling and a 2L teacher-forcing attention topology.
+## 🏛️ Architectural Faithfulness
 
-### Key Architectural Features:
-- **Physical Shuffling (Appendix B.10)**: Tokens and their **Rotary Positional Embeddings (RoPE)** are physically reordered during training. This allows a standard causal mask to implement the "Any-Order" objective without complex attention bias matrices.
-- **Teacher Forcing 2L Mask (Figure 9)**: A specialized 2L x 2L attention mask used in the Sequential Phase:
-    - **Clean Half ($x$)**: Standard causal attention (Teacher).
-    - **Noisy Half ($z$)**: Tokens attend to the **clean prefix** ($x_{<i}$) and themselves ($z_i$).
-    - This forces the model to learn grammar and logic from ground-truth context while predicting noisy tokens.
-- **Unified Denoising Path**: A single objective $\mathcal{L} = (1 - \kappa)\mathcal{L}_{seq} + \kappa\mathcal{L}_{diff}$ ensures shared representations between sequential and parallel generation.
-- **Cosine Alpha Schedule**: Linear interpolation of the masking ratio $\alpha_t = \alpha_0(1 - t)$ for stable diffusion sketching.
+This implementation is mathematically aligned with the **Eso-LM (B)** setup described in *"Esoteric Language Models: Bridging Autoregressive and Masked Diffusion LLMs"* (arXiv:2506.01928).
 
-## Deviations & Optimizations
+> [!IMPORTANT]
+> **Key Innovation**: Unlike standard MDMs that use bidirectional attention, Eso-LM (B) utilizes **Causal Attention** for both diffusion and sequential phases. This allows the model to leverage standard KV-caching optimizations, achieving up to 65x faster inference than traditional diffusion models.
 
-While this model is functionally faithful to the Eso-LM (B) objective, several technical modifications were made to optimize for consumer hardware (RTX 4060 8GB) and modern training stability:
+### 1. Unified Any-Order Loss
+The model optimizes a joint objective function $\mathcal{L} = \mathcal{L}_{AR} + \mathcal{L}_{MDM}$, controlled by the interpolation factor $\alpha_0$.
+- **Sequential Phase ($\mathcal{L}_{AR}$)**: Learns the next-token prediction in a 2L "Teacher Forcing" topology.
+- **Diffusion Phase ($\mathcal{L}_{MDM}$)**: Learns to denoise globally masked sequences with a noise-aware NELBO weighting.
 
-1.  **Physical Shuffling vs. Attention Bias**: The paper often describes Any-Order masking via complex 2D bias matrices. We implement this via **Physical Reordering** of the token and RoPE tensors. This allows the use of standard, high-performance Causal Attention kernels while achieving the same mathematical result.
-2.  **Modern Activation (SiLU)**: We replaced the original paper's activation with **SiLU** (the core of the SwiGLU activation used in Llama 3). This provides smoother gradient flow and better stability for the diffusion task.
-3.  **Gradient Accumulation**: To stabilize the noisy gradients of the Masked Diffusion task on limited VRAM, we utilize **Gradient Accumulation (8 steps)**. This simulates a large global batch size of 64 while maintaining a small memory footprint.
-4.  **Iterative Polishing (Inference)**: Our inference script utilizes **3-pass Iterative Polishing**. This allows the model to "re-read" its own generated stories and correct logical or grammatical slips, a technique used by the authors to maximize coherence in smaller models.
-5.  **Byte-Fallback Tokenization**: We utilize a **10,000 vocab BPE tokenizer with Byte-Fallback** to ensure that rare characters (like capital letters) are never lost as `[UNK]` tokens.
+### 2. Attention Masking Strategy
+The model employs two distinct attention modes to bridge the paradigms:
+- **`diffusion_mode=True`**: Standard causal masking applied to a randomly shuffled token sequence. This implements the "Any-Order AR" property required for diffusion.
+- **`diffusion_mode=False`**: A specialized **2L Teacher Forcing Mask**. The input is doubled ($[x_{shuffled}, z_{shuffled}]$), where the second half ($z$) attends to the clean ground-truth prefix ($x$) and its own history, forcing the model to learn structure from clean context.
 
-### Generation Workflow
-```mermaid
-sequenceDiagram
-    participant U as User Prompt
-    participant D as Phase 1: Diffusion Sketching (Parallel)
-    participant S as Phase 2: Sequential Polishing (Teacher Forcing)
-    participant O as Final Story
+### 3. Physical Shuffling & RoPE
+Instead of complex attention bias matrices, we utilize **Physical Reordering**. Tokens and their **Rotary Positional Embeddings (RoPE)** are physically shuffled in memory before the transformer blocks. This allows the use of high-performance, hardware-native causal kernels while maintaining mathematical correctness for the Any-Order objective.
 
-    U->>D: Initial [MASK] sequence
-    Note over D: Physical Shuffling & Causal Masking
-    D->>S: Draft Story
-    Note over S: 2L Teacher Forcing Refinement
-    S->>O: High-Coherence English Story
-```
+---
 
-## Project Structure
+## ⚡ Performance Optimizations
 
-- `train_esolm.py`: Core training script implementing the faithful dual-objective and physical shuffling.
-- `inference_esolm.py`: High-performance inference engine with two-phase (Diffusion + Sequential) generation.
-- `README.md`: Technical documentation and architectural overview.
+To enable training of this "Behemoth" architecture on consumer hardware (8GB VRAM), several industrial optimizations were implemented:
 
-## Technical Specifications (RTX 4060 Optimized)
+*   **Shuffled-Domain Loss**: Instead of aligning model logits (a $B \times L \times V$ operation), we shuffle the training targets to match the physical token order. This drastically reduces VRAM overhead.
+*   **Zero-Latency Data Engine**: A GPU-native vectorized engine that prepares batches in VRAM, eliminating CPU bottlenecks during the diffusion noise sampling.
+*   **Low-Discrepancy Sampling**: Uses a jittered noise schedule for the diffusion phase to ensure more uniform coverage of the noise space during small training runs.
+
+---
+
+## 📊 Technical Specifications
 
 | Parameter | Value | Description |
 | :--- | :--- | :--- |
-| **Model Size** | ~33.6M | 8 Layers, 8 Heads, 512 Dim |
-| **Context Length** | 256 | Optimized for full TinyStories coverage |
-| **Batch Size** | 16 | Stable training on 8GB VRAM |
-| **Masking** | $\alpha_0 = 0.5$ | Core Eso-LM interpolation factor |
-| **Optimizer** | AdamW | LR 4e-4 with 2000 step warmup |
+| **Backbone** | Transformer | 8 Layers, 8 Heads, 512-dim |
+| **Activation** | SwiGLU | Modern SiLU-based expansion for stable gradients |
+| **Context** | 256 Tokens | Optimized for TinyStories dataset |
+| **Vocab** | 10,000 | BPE with Byte-Fallback (SentencePiece) |
+| **Interpolation** | $\alpha_0 = 0.5$ | Balances AR and Diffusion training |
+| **VRAM Target** | ~6.5 GB | Fully compatible with RTX 3060/4060 |
 
-## Setup & Usage
+---
 
-1. **Clean Slate (Required if changing architecture)**:
-   ```powershell
-   del esolm_*.pt
-   ```
+## 🚀 Getting Started
 
-2. **Training**:
-   ```bash
-   python train_esolm.py
-   ```
+### Training
+The training script handles dataset streaming, BPE training, and the dual-objective training loop.
+```bash
+python train_esolm.py
+```
 
-3. **Inference**:
-   ```bash
-   python inference_esolm.py
-   ```
+### Inference
+The inference engine supports two generation modes. By default, it uses a **4-step diffusion sketch** followed by iterative refinement.
+```bash
+python inference_esolm.py
+```
 
-## References
+---
+
+## 📜 References
 - Sahoo et al. (2025). [Esoteric Language Models (Eso-LMs)](https://arxiv.org/abs/2506.01928)
-- Eldan, R., & Li, Y. (2023). [TinyStories](https://arxiv.org/abs/2305.07759)
+- Eldan & Li (2023). [TinyStories: How Small Can Language Models Be?](https://arxiv.org/abs/2305.07759)
